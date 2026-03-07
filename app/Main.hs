@@ -1,4 +1,6 @@
 module Main (main) where
 
+import Chompsky.CLI (run)
+
 main :: IO ()
-main = putStrLn "Hello, Haskell!"
+main = run

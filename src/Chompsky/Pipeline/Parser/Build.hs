@@ -1,0 +1,106 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+-- | Build 'ScannerEntry' values from Lua-driven 'ParserSpec' definitions.
+module Chompsky.Pipeline.Parser.Build
+    ( buildEntries
+    ) where
+
+import Control.Applicative (many)
+import Data.Text qualified as T
+import Text.Megaparsec (choice, optional, satisfy, try)
+
+import Chompsky.Config.ParserSpec
+    ( ParserSpec (..)
+    , ParserStrategy (..)
+    , SpecEntry (..)
+    )
+import Chompsky.Pipeline.Parser.Internal
+import Chompsky.Types
+
+buildEntries :: ParserSpec -> [ScannerEntry]
+buildEntries spec = map (buildOne spec) (psEntries spec)
+
+buildOne :: ParserSpec -> SpecEntry -> ScannerEntry
+buildOne spec entry =
+    let cat = psCategory spec
+        merge = CollectUnique
+        parser = case psStrategy spec of
+            PhraseStrategy -> buildPhraseParser entry
+            VerbalStrategy -> buildVerbalParser spec entry
+            TriggerStrategy -> buildTriggerParser entry
+            MonetaryStrategy -> buildMonetaryParser entry
+            CaptureStrategy -> buildCaptureParser entry
+     in ScannerEntry cat merge parser
+
+buildPhraseParser :: SpecEntry -> Parser ExtractedValue
+buildPhraseParser entry =
+    TagValue (seTag entry) <$ oneOfLits (sePhrases entry)
+
+buildVerbalParser :: ParserSpec -> SpecEntry -> Parser ExtractedValue
+buildVerbalParser spec entry =
+    choice
+        [ try prefixForm
+        , try suffixForm
+        , try adverbDirectForm
+        ]
+    where
+        tag = seTag entry
+        synonyms = seSynonyms entry
+        suffixExtra = seSuffixExtra entry
+        adverbs = psAdverbs spec
+        actionVerbs = psActionVerbs spec
+        suffixVerbs = psSuffixVerbs spec
+        directPhrases = seDirectPhrases entry
+
+        -- "replaced roof" / "updated kitchen" — verb then synonym
+        prefixForm = do
+            _ <- oneOfLits actionVerbs
+            ws
+            _ <- optional (oneOfLits adverbs <* ws)
+            _ <- oneOfLits synonyms
+            TagWithYear tag <$> optionalYear
+
+        -- "roof replaced" / "kitchen updated in 2020" — synonym then verb
+        suffixForm = do
+            _ <- oneOfLits (synonyms ++ suffixExtra)
+            ws
+            _ <- optional (oneOfLits adverbs <* ws)
+            _ <- oneOfLits suffixVerbs
+            TagWithYear tag <$> optionalYear
+
+        -- "recently installed solar" — adverb then direct phrase
+        adverbDirectForm = do
+            _ <- oneOfLits adverbs
+            ws
+            _ <- oneOfLits (if null directPhrases then synonyms else directPhrases)
+            TagWithYear tag <$> optionalYear
+
+buildTriggerParser :: SpecEntry -> Parser ExtractedValue
+buildTriggerParser entry = do
+    _ <- oneOfLits (seTriggers entry)
+    ws
+    YearValue <$> yearP
+
+buildMonetaryParser :: SpecEntry -> Parser ExtractedValue
+buildMonetaryParser entry = do
+    _ <- oneOfLits (seLabels entry)
+    _ <- optional (ws *> oneOfLits (seBridges entry))
+    ws
+    amt <- amountP
+    _ <- optional (ws *> oneOfLits (seFrequency entry))
+    pure (AmountValue amt)
+
+buildCaptureParser :: SpecEntry -> Parser ExtractedValue
+buildCaptureParser entry = do
+    _ <- oneOfLits (seTriggers entry)
+    ws
+    rest <- many (satisfy (not . isTerminator))
+    let captured = T.strip (T.pack rest)
+    if T.null captured
+        then fail "empty capture"
+        else pure (CapturedText captured)
+    where
+        terminators = T.unpack (seTerminators entry)
+        isTerminator c
+            | null terminators = c == '.' || c == '!' || c == ';'
+            | otherwise = c `elem` terminators
