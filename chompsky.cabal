@@ -60,6 +60,7 @@ library
       , optparse-applicative
       , mtl
       , hashable
+      , hazy
 
 executable chompsky
     import:           warnings
