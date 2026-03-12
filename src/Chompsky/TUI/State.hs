@@ -1,5 +1,6 @@
 {-# LANGUAGE StrictData #-}
 
+-- | TUI state type and pure state-transition function for backfill progress.
 module Chompsky.TUI.State
     ( TUIState (..)
     , Phase (..)

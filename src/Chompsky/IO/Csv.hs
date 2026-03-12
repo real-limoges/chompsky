@@ -24,6 +24,7 @@ import Chompsky.Types
 
 import System.IO (IOMode (..), withFile)
 
+-- | Split pipeline results into extraction rows (all) and review rows (flagged only).
 buildCsvRows :: Text -> [(InputRow, ProcessResult)] -> ([ExtractionRow], [ReviewRow])
 buildCsvRows nowText results = (extractionRows, reviewRows)
     where
@@ -54,22 +55,34 @@ buildCsvRows nowText results = (extractionRows, reviewRows)
                             }
                 else Nothing
 
+-- | One row in the extractions output CSV.
 data ExtractionRow = ExtractionRow
     { erRowId :: Text
+    -- ^ Source row identifier.
     , erExtractionJson :: Text
     -- ^ Full categories map serialised as JSON.
     , erNeedsLlm :: Bool
+    -- ^ Whether this row was flagged for LLM review.
     , erConfidence :: Text
+    -- ^ Confidence tier as text (@"high"@, @"medium"@, @"low"@).
     , erConfidenceScore :: Double
+    -- ^ Raw numeric confidence score.
     , erParsedAt :: Text
+    -- ^ ISO-8601 timestamp of when the row was parsed.
     }
 
+-- | One row in the reviews output CSV (only rows flagged for LLM review).
 data ReviewRow = ReviewRow
     { rrRowId :: Text
+    -- ^ Source row identifier.
     , rrRemarksClean :: Text
+    -- ^ Cleaned remark text.
     , rrTriageReason :: Text
+    -- ^ Human-readable triage reason.
     , rrTriageDetails :: Text
+    -- ^ Triage details serialised as JSON.
     , rrPartialExtraction :: Text
+    -- ^ Partial extraction serialised as JSON.
     }
 
 instance ToNamedRecord ExtractionRow where
@@ -114,11 +127,13 @@ instance DefaultOrdered ReviewRow where
             , "partial_extraction"
             ]
 
+-- | Write extraction rows to a CSV file.
 writeExtractions :: FilePath -> [ExtractionRow] -> IO ()
 writeExtractions path rows =
     withFile path WriteMode $ \h ->
         BL.hPut h (encodeDefaultOrderedByName rows)
 
+-- | Write review rows to a CSV file.
 writeReviews :: FilePath -> [ReviewRow] -> IO ()
 writeReviews path rows =
     withFile path WriteMode $ \h ->

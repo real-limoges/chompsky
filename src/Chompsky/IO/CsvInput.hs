@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | CSV input parsing for two-column (id, text) files.
 module Chompsky.IO.CsvInput
     ( readInputCsv
     , readInputCsvLimit
@@ -26,5 +27,6 @@ readInputCsv path = do
         Left err -> fail $ "CSV parse error: " <> err
         Right (_, rows) -> pure (V.toList rows)
 
+-- | Like 'readInputCsv' but returns at most @n@ rows.
 readInputCsvLimit :: FilePath -> Int -> IO [InputRow]
 readInputCsvLimit path n = take n <$> readInputCsv path

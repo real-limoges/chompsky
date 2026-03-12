@@ -7,11 +7,9 @@ module Chompsky.Config
       AbbreviationConfig
     , wordReplacements
     , phraseReplacements
-    , buildAbbrev
     , BoilerplateConfig
     , boilerplatePhrases
     , minPosition
-    , buildBoilerplate
 
       -- * Transparent aggregate config
     , AppConfig (..)
@@ -41,23 +39,34 @@ import System.FilePath ((</>))
 import Chompsky.Config.ParserSpec (ParserSpec, loadParserSpecs)
 import Chompsky.Types (TriageConfig (..))
 
+-- | Abbreviation expansion rules loaded from @abbreviations.lua@.
 data AbbreviationConfig = AbbreviationConfig
     { wordReplacements :: HashMap Text Text
-    , phraseReplacements :: [(Text, Text)] -- sorted longest-first
+    -- ^ Single-word substitutions applied with word-boundary guards.
+    , phraseReplacements :: [(Text, Text)]
+    -- ^ Multi-word phrase replacements, sorted longest-first.
     }
     deriving (Show, Eq)
 
+-- | Boilerplate-stripping rules loaded from @boilerplate.lua@.
 data BoilerplateConfig = BoilerplateConfig
     { boilerplatePhrases :: [Text]
+    -- ^ Phrases to remove from input text.
     , minPosition :: Int
+    -- ^ Character position threshold; phrases before this offset are kept.
     }
     deriving (Show, Eq)
 
+-- | Aggregate configuration for the entire pipeline, loaded from a config directory.
 data AppConfig = AppConfig
     { abbreviationConfig :: AbbreviationConfig
+    -- ^ Abbreviation expansion rules.
     , boilerplateConfig :: BoilerplateConfig
+    -- ^ Boilerplate phrase stripping rules.
     , parserSpecs :: [ParserSpec]
+    -- ^ Parser specifications loaded from @parsers/*.lua@.
     , triageConfig :: TriageConfig
+    -- ^ Triage-stage thresholds and watch lists.
     }
     deriving (Show, Eq)
 

@@ -82,15 +82,15 @@ data ParserSpec = ParserSpec
     }
     deriving (Show, Eq)
 
-peekOptionalList :: Peeker Lua.Exception Text -> Peeker Lua.Exception [Text]
-peekOptionalList p idx = do
+peekListOrNil :: Peeker Lua.Exception Text -> Peeker Lua.Exception [Text]
+peekListOrNil p idx = do
     ty <- liftLua (Lua.ltype idx)
     case ty of
         Lua.TypeNil -> pure []
         _ -> peekList p idx
 
-peekOptionalText :: Peeker Lua.Exception Text
-peekOptionalText idx = do
+peekTextOrNil :: Peeker Lua.Exception Text
+peekTextOrNil idx = do
     ty <- liftLua (Lua.ltype idx)
     case ty of
         Lua.TypeNil -> pure ""
@@ -101,15 +101,15 @@ peekSpecEntry idx =
     retrieving "SpecEntry" $
         SpecEntry
             <$> peekFieldRaw peekText "tag" idx
-            <*> peekFieldRaw (peekOptionalList peekText) "phrases" idx
-            <*> peekFieldRaw (peekOptionalList peekText) "synonyms" idx
-            <*> peekFieldRaw (peekOptionalList peekText) "suffix_extra" idx
-            <*> peekFieldRaw (peekOptionalList peekText) "triggers" idx
-            <*> peekFieldRaw (peekOptionalList peekText) "labels" idx
-            <*> peekFieldRaw (peekOptionalList peekText) "bridges" idx
-            <*> peekFieldRaw (peekOptionalList peekText) "frequency" idx
-            <*> peekFieldRaw peekOptionalText "terminators" idx
-            <*> peekFieldRaw (peekOptionalList peekText) "direct_phrases" idx
+            <*> peekFieldRaw (peekListOrNil peekText) "phrases" idx
+            <*> peekFieldRaw (peekListOrNil peekText) "synonyms" idx
+            <*> peekFieldRaw (peekListOrNil peekText) "suffix_extra" idx
+            <*> peekFieldRaw (peekListOrNil peekText) "triggers" idx
+            <*> peekFieldRaw (peekListOrNil peekText) "labels" idx
+            <*> peekFieldRaw (peekListOrNil peekText) "bridges" idx
+            <*> peekFieldRaw (peekListOrNil peekText) "frequency" idx
+            <*> peekFieldRaw peekTextOrNil "terminators" idx
+            <*> peekFieldRaw (peekListOrNil peekText) "direct_phrases" idx
 
 peekParserSpec :: Peeker Lua.Exception ParserSpec
 peekParserSpec idx = retrieving "ParserSpec" $ do
@@ -124,9 +124,9 @@ peekParserSpec idx = retrieving "ParserSpec" $ do
         "capture" -> pure CaptureStrategy
         other -> fail ("unknown parser strategy: " <> T.unpack other)
     entries <- peekFieldRaw (peekList peekSpecEntry) "entries" idx
-    adverbs <- peekFieldRaw (peekOptionalList peekText) "adverbs" idx
-    actionVerbs <- peekFieldRaw (peekOptionalList peekText) "action_verbs" idx
-    suffixVerbs <- peekFieldRaw (peekOptionalList peekText) "suffix_verbs" idx
+    adverbs <- peekFieldRaw (peekListOrNil peekText) "adverbs" idx
+    actionVerbs <- peekFieldRaw (peekListOrNil peekText) "action_verbs" idx
+    suffixVerbs <- peekFieldRaw (peekListOrNil peekText) "suffix_verbs" idx
     pure (ParserSpec version category strategy entries adverbs actionVerbs suffixVerbs)
 
 {- | Check that required fields are populated for the spec's strategy.

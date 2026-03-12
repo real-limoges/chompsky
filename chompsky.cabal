@@ -1,11 +1,19 @@
 cabal-version:      3.14
 name:               chompsky
-version:            0.1.0.0
+version:            1.0.0.0
+synopsis:           Structured data extraction from natural language remarks
+description:
+    Chompsky is a text extraction pipeline that parses structured data from
+    natural language remarks. It uses a pure functional core driven by Lua
+    configuration files, with Mamdani fuzzy inference for confidence scoring
+    and a triage stage that flags ambiguous inputs for LLM review.
+category:           Text, NLP
 license:            BSD-3-Clause
 license-file:       LICENSE
 author:             Real Limoges
 maintainer:         b.real.limoges@gmail.com
 build-type:         Simple
+tested-with:        GHC ==9.12.2
 
 common warnings
     ghc-options: -Wall
@@ -16,13 +24,15 @@ library
     default-language: GHC2024
     exposed-modules:
         Chompsky.Types
-        Chompsky.CLI
         Chompsky.Config
         Chompsky.Config.ParserSpec
+        Chompsky.Pipeline
         Chompsky.IO.Csv
         Chompsky.IO.CsvInput
         Chompsky.IO.Workers
-        Chompsky.Pipeline
+        Chompsky.CLI
+        Chompsky.Pipeline.Fuzzy
+    other-modules:
         Chompsky.Pipeline.Clean
         Chompsky.Pipeline.Normalize
         Chompsky.Pipeline.Scanner
@@ -30,8 +40,6 @@ library
         Chompsky.Pipeline.Parser.Internal
         Chompsky.Pipeline.Parser.Build
         Chompsky.Pipeline.Triage
-        Chompsky.Pipeline.Fuzzy
-        Chompsky.Pipeline.Fuzzy.Internal
         Chompsky.TUI
         Chompsky.TUI.State
         Chompsky.TUI.Widgets
@@ -81,3 +89,12 @@ test-suite chompsky-test
     build-depends:
         base ^>=4.21.0.0
       , chompsky
+      , tasty
+      , tasty-hunit
+      , text
+      , containers
+      , aeson
+      , bytestring
+      , directory
+      , filepath
+      , temporary
