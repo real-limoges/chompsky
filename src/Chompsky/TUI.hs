@@ -1,10 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE StrictData #-}
 
+-- | Brick-based terminal UI for the backfill command.
 module Chompsky.TUI
     ( runTUI
     , withLineBuffering
-    , formatSummary
     ) where
 
 import Brick (App (..), BrickEvent (..), EventM, Widget, customMain, halt, modify, neverShowCursor)

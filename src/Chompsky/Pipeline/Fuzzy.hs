@@ -1,73 +1,105 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 -- | Mamdani fuzzy inference: feature count + ambiguity → confidence score and tier.
 module Chompsky.Pipeline.Fuzzy
     ( fuzzyConfidence
     ) where
 
-import Chompsky.Pipeline.Fuzzy.Internal (trapezoidal, triangular)
 import Chompsky.Types (Confidence (..))
+import Data.Map.Strict qualified as Map
+import Data.Text qualified as T
+import Hazy
 
 {- | Inputs clamped: featureCount ≤ 10, ambiguityCount ≤ 5.
 Tiers: High ≥ 0.65, Medium ≥ 0.35, Low < 0.35.
 -}
 fuzzyConfidence :: Int -> Int -> (Double, Confidence)
 fuzzyConfidence featureCount ambiguityCount =
-    let features = min 10.0 (fromIntegral featureCount)
-        ambiguity = min 5.0 (fromIntegral ambiguityCount)
-        (wLow, wMed, wHigh) = applyRules features ambiguity
-        score = defuzzify wLow wMed wHigh
+    let inputs =
+            Map.fromList
+                [ ("features", min 10.0 (fromIntegral featureCount))
+                , ("ambiguity", min 5.0 (fromIntegral ambiguityCount))
+                ]
+        outputs = evaluate confidenceFIS inputs
+        score = Map.findWithDefault 0.5 "confidence" outputs
         tier
             | score >= 0.65 = High
             | score >= 0.35 = Medium
             | otherwise = Low
      in (score, tier)
 
--- Feature richness (range 0–10+)
-featFew, featSome, featMany :: Double -> Double
-featFew = triangular 0 0 2
-featSome = triangular 1 3 5
-featMany = trapezoidal 4 6 10 10
+confidenceFIS :: FIS
+confidenceFIS =
+    FIS
+        { fisName = "confidence"
+        , fisInputs =
+            Map.fromList
+                [ ("features", featuresVar)
+                , ("ambiguity", ambiguityVar)
+                ]
+        , fisOutputs = Map.singleton "confidence" confidenceVar
+        , fisRules = rules
+        , fisMethod = Mamdani
+        }
 
--- Ambiguity severity (range 0–5)
-ambNone, ambMild, ambSevere :: Double -> Double
-ambNone = triangular 0 0 1
-ambMild = triangular 0 1 3
-ambSevere = trapezoidal 2 3 5 5
+featuresVar :: LinguisticVar
+featuresVar =
+    LinguisticVar
+        { lvName = "features"
+        , lvTerms =
+            Map.fromList
+                [ ("few", FuzzySet "few" (triangular 0 0 2) (0, 10))
+                , ("some", FuzzySet "some" (triangular 1 3 5) (0, 10))
+                , ("many", FuzzySet "many" (trapezoidal 4 6 10 10) (0, 10))
+                ]
+        , lvBounds = (0, 10)
+        }
 
--- Pre-computed centroids of the output sets (analytical for symmetric triangles).
-centroidLow, centroidMedium, centroidHigh :: Double
-centroidLow = (0.0 + 0.0 + 0.4) / 3.0 -- ≈ 0.133
-centroidMedium = (0.2 + 0.5 + 0.8) / 3.0 -- 0.5
-centroidHigh = (0.6 + 1.0 + 1.0) / 3.0 -- ≈ 0.867
+ambiguityVar :: LinguisticVar
+ambiguityVar =
+    LinguisticVar
+        { lvName = "ambiguity"
+        , lvTerms =
+            Map.fromList
+                [ ("none", FuzzySet "none" (triangular 0 0 1) (0, 5))
+                , ("mild", FuzzySet "mild" (triangular 0 1 3) (0, 5))
+                , ("severe", FuzzySet "severe" (trapezoidal 2 3 5 5) (0, 5))
+                ]
+        , lvBounds = (0, 5)
+        }
 
--- | 9-rule Mamdani rule base; each rule fires with strength = min(antecedents).
-applyRules :: Double -> Double -> (Double, Double, Double)
-applyRules features ambiguity =
-    let ff = featFew features
-        fs = featSome features
-        fm = featMany features
-        an = ambNone ambiguity
-        am = ambMild ambiguity
-        as_ = ambSevere ambiguity
-        r1 = min ff an -- few ∧ none  → low
-        r2 = min ff am -- few ∧ mild  → low
-        r3 = min ff as_ -- few ∧ severe → low
-        r4 = min fs an -- some ∧ none  → high
-        r5 = min fs am -- some ∧ mild  → medium
-        r6 = min fs as_ -- some ∧ severe → low
-        r7 = min fm an -- many ∧ none  → high
-        r8 = min fm am -- many ∧ mild  → medium
-        r9 = min fm as_ -- many ∧ severe → low
-        activationLow = maximum [r1, r2, r3, r6, r9]
-        activationMedium = max r5 r8
-        activationHigh = max r4 r7
-     in (activationLow, activationMedium, activationHigh)
+confidenceVar :: LinguisticVar
+confidenceVar =
+    LinguisticVar
+        { lvName = "confidence"
+        , lvTerms =
+            Map.fromList
+                [ ("low", FuzzySet "low" (triangular 0 0 0.4) (0, 1))
+                , ("medium", FuzzySet "medium" (triangular 0.2 0.5 0.8) (0, 1))
+                , ("high", FuzzySet "high" (triangular 0.6 1.0 1.0) (0, 1))
+                ]
+        , lvBounds = (0, 1)
+        }
 
--- Converts the fuzzy output back to a single crisp number via weighted average
--- of each output set's centroid, where weights are the rule activation strengths.
-defuzzify :: Double -> Double -> Double -> Double
-defuzzify wLow wMed wHigh
-    | totalWeight == 0 = 0.5 -- degenerate case: no rule fired at all
-    | otherwise = numerator / totalWeight
-    where
-        numerator = wLow * centroidLow + wMed * centroidMedium + wHigh * centroidHigh
-        totalWeight = wLow + wMed + wHigh
+rules :: [FuzzyRule]
+rules =
+    [ rule ["features" ~> "few", "ambiguity" ~> "none"] "low"
+    , rule ["features" ~> "few", "ambiguity" ~> "mild"] "low"
+    , rule ["features" ~> "few", "ambiguity" ~> "severe"] "low"
+    , rule ["features" ~> "some", "ambiguity" ~> "none"] "high"
+    , rule ["features" ~> "some", "ambiguity" ~> "mild"] "medium"
+    , rule ["features" ~> "some", "ambiguity" ~> "severe"] "low"
+    , rule ["features" ~> "many", "ambiguity" ~> "none"] "high"
+    , rule ["features" ~> "many", "ambiguity" ~> "mild"] "medium"
+    , rule ["features" ~> "many", "ambiguity" ~> "severe"] "low"
+    ]
+
+(~>) :: T.Text -> T.Text -> (T.Text, T.Text)
+(~>) = (,)
+
+rule :: [(T.Text, T.Text)] -> T.Text -> FuzzyRule
+rule antecedents consequentTerm =
+    FuzzyRule
+        { ruleAntecedent = antecedents
+        , ruleConsequent = [("confidence", consequentTerm)]
+        }

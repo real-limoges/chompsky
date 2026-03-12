@@ -1,4 +1,6 @@
 packages: .
 
-optional-packages:
-    ../hazy
+source-repository-package
+    type: git
+    location: https://github.com/real-limoges/hazy.git
+    tag: fcd26d1860eb959ce270bff539da3f66ec14e5ea

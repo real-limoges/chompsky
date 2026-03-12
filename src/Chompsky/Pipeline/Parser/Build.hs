@@ -78,14 +78,14 @@ buildVerbalParser spec entry =
 buildTriggerParser :: SpecEntry -> Parser ExtractedValue
 buildTriggerParser entry = do
     _ <- oneOfLits (seTriggers entry)
-    ws
+    _ <- optional ws
     YearValue <$> yearP
 
 buildMonetaryParser :: SpecEntry -> Parser ExtractedValue
 buildMonetaryParser entry = do
     _ <- oneOfLits (seLabels entry)
     _ <- optional (ws *> oneOfLits (seBridges entry))
-    ws
+    _ <- optional ws
     amt <- amountP
     _ <- optional (ws *> oneOfLits (seFrequency entry))
     pure (AmountValue amt)
@@ -93,7 +93,7 @@ buildMonetaryParser entry = do
 buildCaptureParser :: SpecEntry -> Parser ExtractedValue
 buildCaptureParser entry = do
     _ <- oneOfLits (seTriggers entry)
-    ws
+    _ <- optional ws
     rest <- many (satisfy (not . isTerminator))
     let captured = T.strip (T.pack rest)
     if T.null captured

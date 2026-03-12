@@ -41,34 +41,60 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Generics (Generic)
 
+-- | A value extracted from natural language text by the scanner.
 data ExtractedValue
-    = TagValue Text
-    | TagWithYear Text (Maybe Int)
-    | YearValue Int
-    | AmountValue Double
-    | CapturedText Text
+    = -- | A simple categorical tag, e.g. @"Solar"@.
+      TagValue Text
+    | -- | A tag with an optional associated year, e.g. @"Roof" 2019@.
+      TagWithYear Text (Maybe Int)
+    | -- | A standalone 4-digit year.
+      YearValue Int
+    | -- | A dollar amount parsed from the text.
+      AmountValue Double
+    | -- | Free-form text captured after a trigger phrase.
+      CapturedText Text
     deriving (Show, Eq, Ord, Generic)
     deriving anyclass (NFData)
 
+-- | Controls how multiple extracted values for the same category are combined.
 data MergeStrategy
-    = CollectUnique
-    | FirstWins
-    | Concatenate
+    = -- | Keep only unique values (set semantics).
+      CollectUnique
+    | -- | Keep the first value encountered; discard later ones.
+      FirstWins
+    | -- | Concatenate all values in encounter order.
+      Concatenate
     deriving (Show, Eq)
 
-data Confidence = High | Medium | Low
+-- | Parser confidence tier, derived from fuzzy inference over feature count and ambiguity.
+data Confidence
+    = -- | Score >= 0.65.
+      High
+    | -- | Score >= 0.35 and < 0.65.
+      Medium
+    | -- | Score < 0.35.
+      Low
     deriving (Show, Eq, Ord, Enum, Bounded, Generic)
     deriving anyclass (NFData)
 
+{- | A quality flag raised by the triage stage. Each constructor identifies a
+specific reason the extraction may need LLM review.
+-}
 data TriageDetail
-    = LongNoSignal {tdWordCount :: Int, tdFeatureCount :: Int}
-    | AmbiguousPhrase {tdCategory :: Text, tdMatchedPhrases :: [Text]}
-    | HighVocabNoExtraction {tdCategory :: Text, tdWordCount :: Int, tdWords :: [Text]}
-    | ConflictingTags {tdCategory :: Text, tdPositive :: [Text], tdNegative :: [Text]}
-    | UnrecognizableText {tdNonAsciiRatio :: Double}
+    = -- | Long input with no extracted features.
+      LongNoSignal {tdWordCount :: Int, tdFeatureCount :: Int}
+    | -- | Input matches known ambiguous phrases for a category.
+      AmbiguousPhrase {tdCategory :: Text, tdMatchedPhrases :: [Text]}
+    | -- | High domain-vocabulary density but no extractions produced.
+      HighVocabNoExtraction {tdCategory :: Text, tdWordCount :: Int, tdWords :: [Text]}
+    | -- | Both positive and negative signals detected for the same category.
+      ConflictingTags {tdCategory :: Text, tdPositive :: [Text], tdNegative :: [Text]}
+    | -- | Text has a high ratio of non-ASCII characters.
+      UnrecognizableText {tdNonAsciiRatio :: Double}
     deriving (Show, Eq, Generic)
     deriving anyclass (NFData)
 
+-- | Machine-readable tag for a 'TriageDetail' (e.g. @"long_remarks_no_signal"@).
 triageDetailTag :: TriageDetail -> Text
 triageDetailTag = \case
     LongNoSignal {} -> "long_remarks_no_signal"
@@ -77,55 +103,79 @@ triageDetailTag = \case
     ConflictingTags {} -> "conflicting_signals"
     UnrecognizableText {} -> "unrecognizable_text"
 
+-- | Complete output of the extraction pipeline for a single input text.
 data Extraction = Extraction
     { categories :: Map Text [ExtractedValue]
+    -- ^ Extracted values keyed by category name.
     , needsLlm :: Bool
+    -- ^ Whether triage flagged this extraction for LLM review.
     , llmReason :: Maybe Text
+    -- ^ Human-readable reason for the LLM flag, if any.
     , triageDetails :: [TriageDetail]
+    -- ^ All triage flags that fired.
     , parserConfidence :: Confidence
+    -- ^ Fuzzy-inferred confidence tier.
     , confidenceScore :: Double
+    -- ^ Raw numeric confidence score in @[0, 1]@.
     }
     deriving (Show, Eq, Generic)
     deriving anyclass (NFData)
 
+-- | Newtype wrapper for text that has passed through the clean stage.
 newtype CleanedText = CleanedText {unCleanedText :: Text}
     deriving (Show, Eq, Ord)
     deriving newtype (NFData)
 
+-- | A single row from the input CSV (id + raw remark text).
 data InputRow = InputRow
     { rowId :: Text
+    -- ^ Unique row identifier from the source CSV.
     , rowText :: Text
+    -- ^ Raw remark text to be processed.
     }
     deriving (Show, Eq, Generic)
     deriving anyclass (NFData)
 
+-- | Top-level application error, caught at the CLI boundary.
 newtype ChompskyError = ChompskyError String
     deriving (Show)
 
 instance Exception ChompskyError
 
+-- | Events emitted by the backfill worker thread, consumed by the TUI.
 data BackfillEvent
-    = InputFetchStarted
-    | InputFetchDone Int
-    | ItemProcessed Bool Confidence
-    | CsvWriteStarted
-    | CsvWriteDone
-    | BackfillFinished
+    = -- | CSV input reading has begun.
+      InputFetchStarted
+    | -- | CSV input reading complete; carries the total row count.
+      InputFetchDone Int
+    | -- | One row processed; carries whether it was flagged and its confidence tier.
+      ItemProcessed Bool Confidence
+    | -- | Output CSV writing has begun.
+      CsvWriteStarted
+    | -- | Output CSV writing complete.
+      CsvWriteDone
+    | -- | All work finished.
+      BackfillFinished
     deriving (Show, Eq)
 
+-- | Triage-stage configuration loaded from @triage.lua@.
 data TriageConfig = TriageConfig
     { tcAmbiguousPhrases :: [(Text, [Text])]
-    -- ^ (category, phrases) pairs for ambiguous phrase detection
+    -- ^ (category, phrases) pairs for ambiguous phrase detection.
     , tcVocabWatchLists :: [(Text, [Text])]
-    -- ^ (category, words) pairs for high-vocab-no-extraction detection
+    -- ^ (category, words) pairs for high-vocab-no-extraction detection.
     , tcConflictingTagPairs :: [(Text, [Text], [Text])]
-    -- ^ (category, positive tags, negative tags) for conflict detection
+    -- ^ (category, positive tags, negative tags) for conflict detection.
     , tcLongNoSignalThreshold :: Int
+    -- ^ Word count above which a featureless input triggers 'LongNoSignal'.
     , tcVocabThreshold :: Int
+    -- ^ Minimum domain-word hits to trigger 'HighVocabNoExtraction'.
     , tcUnrecognizableRatioThreshold :: Double
+    -- ^ Non-ASCII ratio above which 'UnrecognizableText' fires.
     }
     deriving (Show, Eq)
 
+-- | An 'Extraction' with no categories, no flags, and 'Low' confidence.
 emptyExtraction :: Extraction
 emptyExtraction =
     Extraction
@@ -137,6 +187,7 @@ emptyExtraction =
         , confidenceScore = 0.0
         }
 
+-- | Render a 'Confidence' tier as lowercase text (@"high"@, @"medium"@, @"low"@).
 confidenceToText :: Confidence -> Text
 confidenceToText = \case
     High -> "high"

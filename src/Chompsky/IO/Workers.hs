@@ -1,5 +1,6 @@
 {-# LANGUAGE StrictData #-}
 
+-- | Streaming row processor with pre-built scanner entries and strict evaluation.
 module Chompsky.IO.Workers
     ( processStreaming
     ) where

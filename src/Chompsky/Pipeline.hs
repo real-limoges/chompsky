@@ -27,9 +27,12 @@ import Chompsky.Pipeline.Scanner (scanAll)
 import Chompsky.Pipeline.Triage (triage)
 import Chompsky.Types (CleanedText (..), Extraction, TriageConfig)
 
+-- | The result of running the full pipeline on a single input text.
 data ProcessResult = ProcessResult
     { prExtraction :: Extraction
+    -- ^ The extraction produced by scanning and triage.
     , prCleanedText :: CleanedText
+    -- ^ The cleaned text that was fed to the scanner.
     }
     deriving (Show, Eq, Generic)
     deriving anyclass (NFData)
