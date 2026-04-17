@@ -13,6 +13,8 @@ module Chompsky.Types
     , Extraction (..)
     , InputRow (..)
     , CleanedText (..)
+    , ProcessTrace (..)
+    , FuzzySnapshot (..)
     , BackfillEvent (..)
     , ChompskyError (..)
     , TriageConfig (..)
@@ -124,7 +126,27 @@ data Extraction = Extraction
 -- | Newtype wrapper for text that has passed through the clean stage.
 newtype CleanedText = CleanedText {unCleanedText :: Text}
     deriving (Show, Eq, Ord)
-    deriving newtype (NFData)
+    deriving newtype (NFData, ToJSON)
+
+-- | Per-stage snapshot of the pipeline for trace consumers (fugue, garcon).
+data ProcessTrace = ProcessTrace
+    { ptInput :: Text
+    , ptNormalized :: Text
+    , ptCleaned :: CleanedText
+    , ptScanned :: Extraction
+    , ptTriaged :: Extraction
+    , ptFuzzy :: FuzzySnapshot
+    }
+    deriving (Show, Eq, Generic)
+    deriving anyclass (NFData)
+
+-- | Numeric score and tier produced by the fuzzy stage.
+data FuzzySnapshot = FuzzySnapshot
+    { fsScore :: Double
+    , fsConfidence :: Confidence
+    }
+    deriving (Show, Eq, Generic)
+    deriving anyclass (NFData)
 
 -- | A single row from the input CSV (id + raw remark text).
 data InputRow = InputRow
@@ -293,3 +315,21 @@ instance FromJSON Extraction where
             <*> ((o .:? "triage_details") <&> fromMaybe [])
             <*> o .: "parser_confidence"
             <*> o .: "confidence_score"
+
+instance ToJSON FuzzySnapshot where
+    toJSON fs =
+        object
+            [ "score" .= fsScore fs
+            , "confidence" .= fsConfidence fs
+            ]
+
+instance ToJSON ProcessTrace where
+    toJSON pt =
+        object
+            [ "input" .= ptInput pt
+            , "normalized" .= ptNormalized pt
+            , "cleaned" .= ptCleaned pt
+            , "scanned" .= ptScanned pt
+            , "triaged" .= ptTriaged pt
+            , "fuzzy" .= ptFuzzy pt
+            ]

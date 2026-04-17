@@ -5,6 +5,8 @@
 module Chompsky.Pipeline
     ( processRemarkPure
     , processRemarkPureWith
+    , processRemarkTraced
+    , processRemarkTracedWith
     , ProcessResult (..)
     ) where
 
@@ -25,7 +27,13 @@ import Chompsky.Pipeline.Normalize (normalize)
 import Chompsky.Pipeline.Parser (ScannerEntry, allEntries)
 import Chompsky.Pipeline.Scanner (scanAll)
 import Chompsky.Pipeline.Triage (triage)
-import Chompsky.Types (CleanedText (..), Extraction, TriageConfig)
+import Chompsky.Types
+    ( CleanedText (..)
+    , Extraction (..)
+    , FuzzySnapshot (..)
+    , ProcessTrace (..)
+    , TriageConfig
+    )
 
 -- | The result of running the full pipeline on a single input text.
 data ProcessResult = ProcessResult
@@ -55,3 +63,23 @@ processRemarkPureWith triageCfg abbrevCfg bpCfg entries rawRemarks =
         extraction = scanAll entries (unCleanedText cleaned)
         triaged = triage triageCfg cleaned extraction
      in ProcessResult triaged cleaned
+
+-- | Like 'processRemarkPure' but captures every stage's output for trace consumers.
+processRemarkTraced :: AppConfig -> Text -> ProcessTrace
+processRemarkTraced cfg =
+    processRemarkTracedWith
+        (triageConfig cfg)
+        (abbreviationConfig cfg)
+        (boilerplateConfig cfg)
+        (allEntries (parserSpecs cfg))
+
+-- | Traced pipeline with pre-built scanner entries (for batch trace generation).
+processRemarkTracedWith ::
+    TriageConfig -> AbbreviationConfig -> BoilerplateConfig -> [ScannerEntry] -> Text -> ProcessTrace
+processRemarkTracedWith triageCfg abbrevCfg bpCfg entries rawRemarks =
+    let normalized = normalize abbrevCfg rawRemarks
+        cleaned = clean bpCfg normalized
+        scanned = scanAll entries (unCleanedText cleaned)
+        triaged = triage triageCfg cleaned scanned
+        fuzzy = FuzzySnapshot (confidenceScore triaged) (parserConfidence triaged)
+     in ProcessTrace rawRemarks normalized cleaned scanned triaged fuzzy
