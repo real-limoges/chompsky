@@ -9,7 +9,7 @@ module Chompsky.Pipeline.Triage
 
 import Data.Char (isAlphaNum, isAscii)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (mapMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -19,85 +19,82 @@ import Chompsky.Types
 
 triage :: TriageConfig -> CleanedText -> Extraction -> Extraction
 triage cfg (CleanedText cleanedText) ext =
-    let wordList = T.words cleanedText
+    ext
+        { needsLlm = not (null triggered)
+        , llmReason = reason
+        , triageDetails = triggered
+        , parserConfidence = tier
+        , confidenceScore = score
+        }
+    where
+        wordList = T.words cleanedText
         wordCount = length wordList
         (!textLen, !nonAsciiCount) =
             T.foldl' (\(!l, !n) c -> (l + 1, if isAscii c then n else n + 1)) (0, 0) cleanedText
-        rules =
-            [ checkLongNoSignal (tcLongNoSignalThreshold cfg) wordCount ext
-            , checkAmbiguousPhrases (tcAmbiguousPhrases cfg) cleanedText
-            , checkHighVocabNoExtraction (tcVocabWatchLists cfg) (tcVocabThreshold cfg) wordList ext
-            , checkConflictingTags (tcConflictingTagPairs cfg) ext
-            , checkUnrecognizable (tcUnrecognizableRatioThreshold cfg) textLen nonAsciiCount
-            ]
-        triggered = concatMap catMaybes rules
-        featureCount = countFeatures ext
-        (score, tier) = fuzzyConfidence featureCount (length triggered)
-     in case triggered of
-            [] -> ext {triageDetails = [], parserConfidence = tier, confidenceScore = score}
-            details ->
-                ext
-                    { needsLlm = True
-                    , llmReason = Just (T.intercalate "," (map triageDetailTag details))
-                    , triageDetails = details
-                    , parserConfidence = tier
-                    , confidenceScore = score
-                    }
+        triggered =
+            concat
+                [ checkLongNoSignal (tcLongNoSignalThreshold cfg) wordCount ext
+                , checkAmbiguousPhrases (tcAmbiguousPhrases cfg) cleanedText
+                , checkHighVocabNoExtraction (tcVocabWatchLists cfg) (tcVocabThreshold cfg) wordList ext
+                , checkConflictingTags (tcConflictingTagPairs cfg) ext
+                , checkUnrecognizable (tcUnrecognizableRatioThreshold cfg) textLen nonAsciiCount
+                ]
+        (score, tier) = fuzzyConfidence (countFeatures ext) (length triggered)
+        reason
+            | null triggered = Nothing
+            | otherwise = Just (T.intercalate "," (map triageDetailTag triggered))
 
 countFeatures :: Extraction -> Int
 countFeatures = sum . map length . Map.elems . categories
 
-checkLongNoSignal :: Int -> Int -> Extraction -> [Maybe TriageDetail]
-checkLongNoSignal threshold wordCount ext =
-    let fc = countFeatures ext
-     in [ if wordCount > threshold && fc == 0
-            then Just (LongNoSignal wordCount fc)
-            else Nothing
-        ]
+checkLongNoSignal :: Int -> Int -> Extraction -> [TriageDetail]
+checkLongNoSignal threshold wordCount ext
+    | wordCount > threshold && fc == 0 = [LongNoSignal wordCount fc]
+    | otherwise = []
+    where
+        fc = countFeatures ext
 
-checkAmbiguousPhrases :: [(Text, [Text])] -> Text -> [Maybe TriageDetail]
+checkAmbiguousPhrases :: [(Text, [Text])] -> Text -> [TriageDetail]
 checkAmbiguousPhrases pairs text =
-    [ let matched = filter (`containsPhrase` text) phrases
-       in if null matched then Nothing else Just (AmbiguousPhrase cat matched)
-    | (cat, phrases) <- pairs
-    ]
+    mapMaybe toDetail pairs
+    where
+        toDetail (cat, phrases) = case filter (`containsPhrase` text) phrases of
+            [] -> Nothing
+            matched -> Just (AmbiguousPhrase cat matched)
 
-checkHighVocabNoExtraction :: [(Text, [Text])] -> Int -> [Text] -> Extraction -> [Maybe TriageDetail]
+checkHighVocabNoExtraction :: [(Text, [Text])] -> Int -> [Text] -> Extraction -> [TriageDetail]
 checkHighVocabNoExtraction watchLists threshold wordList ext =
-    [ let wordSet = Set.fromList ws
-          matched = filter (\w -> Set.member (T.toLower w) wordSet) wordList
-          matchCount = length matched
-          existing = fromMaybe [] (Map.lookup cat (categories ext))
-       in if matchCount > threshold && null existing
-            then Just (HighVocabNoExtraction cat matchCount (map T.toLower matched))
-            else Nothing
-    | (cat, ws) <- watchLists
-    ]
+    mapMaybe toDetail watchLists
+    where
+        toDetail (cat, ws)
+            | matchCount > threshold && null (Map.findWithDefault [] cat (categories ext)) =
+                Just (HighVocabNoExtraction cat matchCount (map T.toLower matched))
+            | otherwise = Nothing
+            where
+                wordSet = Set.fromList ws
+                matched = filter (\w -> Set.member (T.toLower w) wordSet) wordList
+                matchCount = length matched
 
-checkConflictingTags :: [(Text, [Text], [Text])] -> Extraction -> [Maybe TriageDetail]
+checkConflictingTags :: [(Text, [Text], [Text])] -> Extraction -> [TriageDetail]
 checkConflictingTags pairs ext =
-    [ let signals = fromMaybe [] (Map.lookup cat (categories ext))
-          tagTexts = [t | TagValue t <- signals]
-          pos = filter (`elem` posTags) tagTexts
-          neg = filter (`elem` negTags) tagTexts
-       in if not (null pos) && not (null neg)
-            then Just (ConflictingTags cat pos neg)
-            else Nothing
-    | (cat, posTags, negTags) <- pairs
-    ]
+    mapMaybe toDetail pairs
+    where
+        toDetail (cat, posTags, negTags)
+            | not (null pos) && not (null neg) = Just (ConflictingTags cat pos neg)
+            | otherwise = Nothing
+            where
+                tagTexts = [t | TagValue t <- Map.findWithDefault [] cat (categories ext)]
+                pos = filter (`elem` posTags) tagTexts
+                neg = filter (`elem` negTags) tagTexts
 
-checkUnrecognizable :: Double -> Int -> Int -> [Maybe TriageDetail]
-checkUnrecognizable threshold textLen nonAsciiCount =
-    [ if textLen == 0
-        then Nothing
-        else
-            let ratio = fromIntegral nonAsciiCount / fromIntegral textLen
-             in if ratio > threshold
-                    then Just (UnrecognizableText ratio)
-                    else Nothing
-    ]
+checkUnrecognizable :: Double -> Int -> Int -> [TriageDetail]
+checkUnrecognizable threshold textLen nonAsciiCount
+    | textLen == 0 = []
+    | ratio > threshold = [UnrecognizableText ratio]
+    | otherwise = []
+    where
+        ratio = fromIntegral nonAsciiCount / fromIntegral textLen
 
--- | Case-insensitive whole-word phrase check.
 containsPhrase :: Text -> Text -> Bool
 containsPhrase phrase text = go (T.toLower text)
     where

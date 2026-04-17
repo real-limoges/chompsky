@@ -108,13 +108,6 @@ buildAbbrev wordPairs phraseList =
         , phraseReplacements = sortBy (comparing (Down . T.length . fst)) phraseList
         }
 
-buildBoilerplate :: [Text] -> Int -> BoilerplateConfig
-buildBoilerplate phrases pos =
-    BoilerplateConfig
-        { boilerplatePhrases = phrases
-        , minPosition = pos
-        }
-
 peekPhraseEntry :: Peeker Lua.Exception (Text, Text)
 peekPhraseEntry idx =
     retrieving "PhraseEntry" $

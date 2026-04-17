@@ -32,17 +32,17 @@ library
         Chompsky.IO.Workers
         Chompsky.CLI
         Chompsky.Pipeline.Fuzzy
+        Chompsky.Pipeline.Scanner
+        Chompsky.Pipeline.Triage
+        Chompsky.Pipeline.Parser
+        Chompsky.TUI.State
+        Chompsky.TUI.Widgets
     other-modules:
         Chompsky.Pipeline.Clean
         Chompsky.Pipeline.Normalize
-        Chompsky.Pipeline.Scanner
-        Chompsky.Pipeline.Parser
         Chompsky.Pipeline.Parser.Internal
         Chompsky.Pipeline.Parser.Build
-        Chompsky.Pipeline.Triage
         Chompsky.TUI
-        Chompsky.TUI.State
-        Chompsky.TUI.Widgets
     build-depends:
         base ^>=4.21.0.0
       , text
@@ -80,6 +80,20 @@ executable chompsky
         base ^>=4.21.0.0
       , chompsky
 
+executable chompsky-trace
+    import:           warnings
+    main-is:          Trace.hs
+    hs-source-dirs:   app
+    default-language: GHC2024
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -A64m -n4m"
+    build-depends:
+        base ^>=4.21.0.0
+      , chompsky
+      , text
+      , bytestring
+      , aeson
+      , optparse-applicative
+
 test-suite chompsky-test
     import:           warnings
     default-language: GHC2024
@@ -98,3 +112,4 @@ test-suite chompsky-test
       , directory
       , filepath
       , temporary
+      , time
