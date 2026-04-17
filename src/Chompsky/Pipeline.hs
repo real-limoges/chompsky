@@ -58,9 +58,9 @@ processRemarkPure cfg =
 processRemarkPureWith ::
     TriageConfig -> AbbreviationConfig -> BoilerplateConfig -> [ScannerEntry] -> Text -> ProcessResult
 processRemarkPureWith triageCfg abbrevCfg bpCfg entries rawRemarks =
-    let normalized = normalize abbrevCfg rawRemarks
-        cleaned = clean bpCfg normalized
-        extraction = scanAll entries (unCleanedText cleaned)
+    let (normalized, _) = normalize abbrevCfg rawRemarks
+        (cleaned, _) = clean bpCfg normalized
+        (extraction, _) = scanAll entries (unCleanedText cleaned)
         triaged = triage triageCfg cleaned extraction
      in ProcessResult triaged cleaned
 
@@ -77,9 +77,19 @@ processRemarkTraced cfg =
 processRemarkTracedWith ::
     TriageConfig -> AbbreviationConfig -> BoilerplateConfig -> [ScannerEntry] -> Text -> ProcessTrace
 processRemarkTracedWith triageCfg abbrevCfg bpCfg entries rawRemarks =
-    let normalized = normalize abbrevCfg rawRemarks
-        cleaned = clean bpCfg normalized
-        scanned = scanAll entries (unCleanedText cleaned)
+    let (normalized, normEdits) = normalize abbrevCfg rawRemarks
+        (cleaned, cleanEdits) = clean bpCfg normalized
+        (scanned, hits) = scanAll entries (unCleanedText cleaned)
         triaged = triage triageCfg cleaned scanned
         fuzzy = FuzzySnapshot (confidenceScore triaged) (parserConfidence triaged)
-     in ProcessTrace rawRemarks normalized cleaned scanned triaged fuzzy
+     in ProcessTrace
+            { ptInput = rawRemarks
+            , ptNormalized = normalized
+            , ptNormalizeEdits = normEdits
+            , ptCleaned = cleaned
+            , ptCleanEdits = cleanEdits
+            , ptScanned = scanned
+            , ptScanHits = hits
+            , ptTriaged = triaged
+            , ptFuzzy = fuzzy
+            }

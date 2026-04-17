@@ -34,15 +34,15 @@ library
         Chompsky.Pipeline.Fuzzy
         Chompsky.Pipeline.Scanner
         Chompsky.Pipeline.Triage
+        Chompsky.Pipeline.Parser
+        Chompsky.TUI.State
+        Chompsky.TUI.Widgets
     other-modules:
         Chompsky.Pipeline.Clean
         Chompsky.Pipeline.Normalize
-        Chompsky.Pipeline.Parser
         Chompsky.Pipeline.Parser.Internal
         Chompsky.Pipeline.Parser.Build
         Chompsky.TUI
-        Chompsky.TUI.State
-        Chompsky.TUI.Widgets
     build-depends:
         base ^>=4.21.0.0
       , text
@@ -112,3 +112,4 @@ test-suite chompsky-test
       , directory
       , filepath
       , temporary
+      , time

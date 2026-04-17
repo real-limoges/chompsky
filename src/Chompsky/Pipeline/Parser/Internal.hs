@@ -24,7 +24,11 @@ import Chompsky.Types (ExtractedValue, MergeStrategy)
 type Parser = Parsec Void Text
 
 data ScannerEntry = ScannerEntry
-    { seCategory :: Text
+    { seId :: Text
+    {- ^ Stable identifier of the form @"<category>/<tag>"@ with a @#N@
+    suffix (2-based) for duplicates within a spec.
+    -}
+    , seCategory :: Text
     , seMerge :: MergeStrategy
     , seParser :: Parser ExtractedValue
     }

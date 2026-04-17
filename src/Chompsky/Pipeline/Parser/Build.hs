@@ -6,6 +6,8 @@ module Chompsky.Pipeline.Parser.Build
     ) where
 
 import Control.Applicative (many)
+import Data.Map.Strict qualified as Map
+import Data.Text (Text)
 import Data.Text qualified as T
 import Text.Megaparsec (choice, optional, satisfy, try)
 
@@ -18,10 +20,19 @@ import Chompsky.Pipeline.Parser.Internal
 import Chompsky.Types
 
 buildEntries :: ParserSpec -> [ScannerEntry]
-buildEntries spec = map (buildOne spec) (psEntries spec)
+buildEntries spec = go Map.empty (psEntries spec)
+    where
+        cat = psCategory spec
+        go _ [] = []
+        go seen (e : es) =
+            let base = cat <> "/" <> seTag e
+                count = Map.findWithDefault (0 :: Int) base seen
+                eid = if count == 0 then base else base <> "#" <> T.pack (show (count + 1))
+                seen' = Map.insert base (count + 1) seen
+             in buildOne spec eid e : go seen' es
 
-buildOne :: ParserSpec -> SpecEntry -> ScannerEntry
-buildOne spec entry =
+buildOne :: ParserSpec -> Text -> SpecEntry -> ScannerEntry
+buildOne spec eid entry =
     let cat = psCategory spec
         merge = CollectUnique
         parser = case psStrategy spec of
@@ -30,7 +41,7 @@ buildOne spec entry =
             TriggerStrategy -> buildTriggerParser entry
             MonetaryStrategy -> buildMonetaryParser entry
             CaptureStrategy -> buildCaptureParser entry
-     in ScannerEntry cat merge parser
+     in ScannerEntry eid cat merge parser
 
 buildPhraseParser :: SpecEntry -> Parser ExtractedValue
 buildPhraseParser entry =

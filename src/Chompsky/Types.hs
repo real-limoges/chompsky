@@ -15,6 +15,11 @@ module Chompsky.Types
     , CleanedText (..)
     , ProcessTrace (..)
     , FuzzySnapshot (..)
+    , Span (..)
+    , ScanHit (..)
+    , TextEdit (..)
+    , EditKind (..)
+    , editKindTag
     , BackfillEvent (..)
     , ChompskyError (..)
     , TriageConfig (..)
@@ -132,13 +137,80 @@ newtype CleanedText = CleanedText {unCleanedText :: Text}
 data ProcessTrace = ProcessTrace
     { ptInput :: Text
     , ptNormalized :: Text
+    , ptNormalizeEdits :: [TextEdit]
     , ptCleaned :: CleanedText
+    , ptCleanEdits :: [TextEdit]
     , ptScanned :: Extraction
+    , ptScanHits :: [ScanHit]
     , ptTriaged :: Extraction
     , ptFuzzy :: FuzzySnapshot
     }
     deriving (Show, Eq, Generic)
     deriving anyclass (NFData)
+
+-- | Half-open character range within a specific text. @spEnd > spStart@.
+data Span = Span
+    { spStart :: Int
+    , spEnd :: Int
+    }
+    deriving (Show, Eq, Generic)
+    deriving anyclass (NFData)
+
+-- | A single scanner match — one firing of one parser entry.
+data ScanHit = ScanHit
+    { shEntryId :: Text
+    {- ^ Stable identifier for the parser entry that produced this hit,
+    of the form @"<category>/<tag>"@ with a @#N@ suffix on duplicates.
+    -}
+    , shCategory :: Text
+    , shValue :: ExtractedValue
+    , shSpan :: Span
+    -- ^ Span in the *cleaned* text (input to the scanner).
+    , shIsNegated :: Bool
+    {- ^ True if the match was preceded by a negation word; such hits are
+    dropped before merging into the final 'Extraction' but retained here
+    so the viz can render them struck-through.
+    -}
+    , shNegationWord :: Maybe Text
+    }
+    deriving (Show, Eq, Generic)
+    deriving anyclass (NFData)
+
+-- | A single edit produced by the Normalize or Clean stage.
+data TextEdit = TextEdit
+    { teKind :: EditKind
+    , teSpan :: Span
+    -- ^ Span in the pre-edit text (the input to the substep that emitted this edit).
+    , teBefore :: Text
+    , teAfter :: Text
+    , teDetail :: Maybe Text
+    -- ^ Optional extra context — e.g. the abbreviation key or boilerplate phrase.
+    }
+    deriving (Show, Eq, Generic)
+    deriving anyclass (NFData)
+
+-- | Kind of transformation applied by a 'TextEdit'.
+data EditKind
+    = AbbrevWord
+    | AbbrevPhrase
+    | PhoneStripped
+    | EmailMasked
+    | PunctCollapsed
+    | WhitespaceCollapsed
+    | BoilerplateStripped
+    deriving (Show, Eq, Generic)
+    deriving anyclass (NFData)
+
+-- | Machine-readable tag for an 'EditKind'.
+editKindTag :: EditKind -> Text
+editKindTag = \case
+    AbbrevWord -> "abbrev_word"
+    AbbrevPhrase -> "abbrev_phrase"
+    PhoneStripped -> "phone_stripped"
+    EmailMasked -> "email_masked"
+    PunctCollapsed -> "punct_collapsed"
+    WhitespaceCollapsed -> "whitespace_collapsed"
+    BoilerplateStripped -> "boilerplate_stripped"
 
 -- | Numeric score and tier produced by the fuzzy stage.
 data FuzzySnapshot = FuzzySnapshot
@@ -328,8 +400,35 @@ instance ToJSON ProcessTrace where
         object
             [ "input" .= ptInput pt
             , "normalized" .= ptNormalized pt
+            , "normalize_edits" .= ptNormalizeEdits pt
             , "cleaned" .= ptCleaned pt
+            , "clean_edits" .= ptCleanEdits pt
             , "scanned" .= ptScanned pt
+            , "scan_hits" .= ptScanHits pt
             , "triaged" .= ptTriaged pt
             , "fuzzy" .= ptFuzzy pt
+            ]
+
+instance ToJSON Span where
+    toJSON s = object ["start" .= spStart s, "end" .= spEnd s]
+
+instance ToJSON ScanHit where
+    toJSON h =
+        object
+            [ "entry_id" .= shEntryId h
+            , "category" .= shCategory h
+            , "value" .= shValue h
+            , "span" .= shSpan h
+            , "is_negated" .= shIsNegated h
+            , "negation_word" .= shNegationWord h
+            ]
+
+instance ToJSON TextEdit where
+    toJSON e =
+        object
+            [ "kind" .= editKindTag (teKind e)
+            , "span" .= teSpan e
+            , "before" .= teBefore e
+            , "after" .= teAfter e
+            , "detail" .= teDetail e
             ]
