@@ -4,6 +4,7 @@
 -- | Brick-based terminal UI for the backfill command.
 module Chompsky.TUI
     ( runTUI
+    , formatSummary
     , withLineBuffering
     ) where
 
@@ -13,7 +14,7 @@ import Brick.BChan (newBChan, writeBChan)
 import Brick.Widgets.Border (borderWithLabel, hBorder)
 import Brick.Widgets.Core (Padding (..), hBox, padLeft, str, vBox)
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (async, cancel, withAsync)
+import Control.Concurrent.Async (withAsync)
 import Control.Concurrent.STM (TChan, atomically, readTChan)
 import Control.Exception (bracket)
 import Control.Monad (when)
@@ -61,8 +62,8 @@ drawUI st = [ui]
         phaseLabel = case phase of
             Fetching -> "Fetching"
             Processing -> "Processing"
-            Writing -> "Writing"
             Done -> "Done"
+            Failed _ -> "Failed"
 
         barWidth = 38
 
@@ -113,30 +114,32 @@ handleEvent ev = case ev of
     VtyEvent (V.EvKey (V.KChar 'c') [V.MCtrl]) -> halt
     _ -> pure ()
 
--- | Bridge events from the worker 'TChan' into Brick; returns on finish or quit.
-runTUI :: TChan BackfillEvent -> IO ()
+{- | Bridge events from the worker 'TChan' into Brick until the worker
+finishes or fails, or the user quits. Returns the final state; the caller
+decides what to print and how to exit, using 'tsFinished' and 'tsPhase'.
+-}
+runTUI :: TChan BackfillEvent -> IO TUIState
 runTUI chan = do
     bchan <- newBChan 100
-    withAsync (bridgeThread bchan) $ \_ -> do
-        ticker <- async (tickThread bchan)
-        let buildVty = VtyCP.mkVty V.defaultConfig
-        initialVty <- buildVty
-        finalSt <- customMain initialVty buildVty (Just bchan) app initialState
-        cancel ticker
-        printSummary finalSt
+    withAsync (bridgeThread bchan) $ \_ ->
+        withAsync (tickThread bchan) $ \_ -> do
+            let buildVty = VtyCP.mkVty V.defaultConfig
+            initialVty <- buildVty
+            customMain initialVty buildVty (Just bchan) app initialState
     where
         bridgeThread bc = do
             ev <- atomically (readTChan chan)
             writeBChan bc (TUIBackfillEvent ev)
             case ev of
                 BackfillFinished -> pure ()
+                BackfillFailed _ -> pure ()
                 _ -> bridgeThread bc
         tickThread bc = do
-            threadDelay 100_000 -- 100ms
+            threadDelay 100_000
             writeBChan bc Tick
             tickThread bc
 
--- | Exported for testing.
+-- | One-line summary printed after a successful backfill.
 formatSummary :: TUIState -> String
 formatSummary st =
     "Done. Processed "
@@ -145,7 +148,7 @@ formatSummary st =
         <> show (tsFlagged st)
         <> " flagged) in "
         <> formatElapsed (tsElapsedSecs st)
-        <> " — "
+        <> ", "
         <> formatRate (tsProcessed st) (tsElapsedSecs st)
         <> " | Conf H:"
         <> show (tsHighConf st)
@@ -153,9 +156,6 @@ formatSummary st =
         <> show (tsMedConf st)
         <> " L:"
         <> show (tsLowConf st)
-
-printSummary :: TUIState -> IO ()
-printSummary = putStrLn . formatSummary
 
 -- | Run an action with stdout/stderr set to line-buffering, restoring on exit.
 withLineBuffering :: IO a -> IO a

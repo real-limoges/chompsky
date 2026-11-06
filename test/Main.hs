@@ -2,24 +2,28 @@
 
 module Main (main) where
 
+import Control.Exception (throwIO, try)
 import Data.Aeson (FromJSON, Object, ToJSON, Value (..), decode, encode, toJSON)
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (sort)
+import Data.List (isSuffixOf, sort)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Data.Time.Clock (UTCTime)
-import System.Directory (getCurrentDirectory)
+import Data.Time.Format.ISO8601 (iso8601ParseM)
+import HsLua.Core qualified as Lua
+import System.Directory (copyFile, createDirectoryIfMissing, getCurrentDirectory, listDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Tasty
 import Test.Tasty.HUnit
 
-import Chompsky.CLI (withErrorBoundary)
+import Chompsky.CLI (BackfillOpts (..), backfillWorker, withErrorBoundary)
 import Chompsky.Config (AppConfig (..), loadConfig, wordReplacements)
 import Chompsky.Config.ParserSpec
     ( ParserSpec (..)
@@ -27,13 +31,14 @@ import Chompsky.Config.ParserSpec
     , SpecEntry (..)
     , validateSpec
     )
-import Chompsky.IO.Csv (ExtractionRow (..), ReviewRow (..), buildCsvRows)
+import Chompsky.IO.Csv (ExtractionRow (..), ReviewRow (..), toExtractionRow, toReviewRow, withCsvOutput)
 import Chompsky.IO.CsvInput (readInputCsv, readInputCsvLimit)
 import Chompsky.IO.Workers (processStreaming)
 import Chompsky.Pipeline (ProcessResult (..), processRemarkPure, processRemarkTraced)
 import Chompsky.Pipeline.Fuzzy (fuzzyConfidence)
 import Chompsky.Pipeline.Parser (ScannerEntry (..), allEntries)
 import Chompsky.Pipeline.Scanner (hitsToExtraction, scanAll, scanHits)
+import Chompsky.Pipeline.Triage (triage)
 import Chompsky.TUI.State
     ( Phase (..)
     , TUIState (..)
@@ -65,6 +70,8 @@ main = do
             , tuiWidgetsTests
             , workersTests cfg
             , cliTests
+            , backfillTests cfg
+            , configSandboxTests
             , scanRoundTripTests cfg
             , traceSchemaTests cfg
             ]
@@ -92,9 +99,14 @@ typesTests =
         , testCase "triageDetailTag LongNoSignal" $
             triageDetailTag (LongNoSignal 100 0) @?= "long_remarks_no_signal"
         , testCase "triageDetailTag AmbiguousPhrase" $
-            triageDetailTag (AmbiguousPhrase "condition" ["as-is"]) @?= "ambiguous_condition"
+            triageDetailTag (AmbiguousPhrase "category" ["assorted"]) @?= "ambiguous_phrase"
         , testCase "triageDetailTag HighVocabNoExtraction" $
-            triageDetailTag (HighVocabNoExtraction "renovation" 5 ["roof"]) @?= "complex_renovation_narrative"
+            triageDetailTag (HighVocabNoExtraction "category" 5 ["laptop"]) @?= "high_vocab_no_extraction"
+        , testCase "pre-2026-11-06 triage tags still decode" $ do
+            decode "{\"rule\":\"ambiguous_condition\",\"category\":\"c\",\"matched_phrases\":[\"x\"]}"
+                @?= Just (AmbiguousPhrase "c" ["x"])
+            decode "{\"rule\":\"complex_renovation_narrative\",\"category\":\"c\",\"word_count\":4,\"words\":[\"x\"]}"
+                @?= Just (HighVocabNoExtraction "c" 4 ["x"])
         , testCase "triageDetailTag ConflictingTags" $
             triageDetailTag (ConflictingTags "condition" ["Good"] ["Poor"]) @?= "conflicting_signals"
         , testCase "triageDetailTag UnrecognizableText" $
@@ -118,22 +130,16 @@ jsonRoundtripTests =
         , testCase "TriageDetail AmbiguousPhrase" $ jsonRoundtrip (AmbiguousPhrase "cond" ["as-is"])
         , testCase "TriageDetail ConflictingTags" $ jsonRoundtrip (ConflictingTags "c" ["A"] ["B"])
         , testCase "TriageDetail UnrecognizableText" $ jsonRoundtrip (UnrecognizableText 0.4)
-        , testCase "Extraction" $ do
-            let ext =
-                    Extraction
-                        { categories = Map.singleton "category" [TagValue "Electronics"]
-                        , needsLlm = False
-                        , llmReason = Nothing
-                        , triageDetails = []
-                        , parserConfidence = High
-                        , confidenceScore = 0.8
-                        }
-            let decoded = decode (encode ext) :: Maybe Extraction
-            assertBool "Extraction should roundtrip" (isJust decoded)
-            let Just ext' = decoded
-            categories ext' @?= categories ext
-            needsLlm ext' @?= needsLlm ext
-            parserConfidence ext' @?= parserConfidence ext
+        , testCase "Extraction" $
+            jsonRoundtrip
+                Extraction
+                    { categories = Map.singleton "category" [TagValue "Electronics"]
+                    , needsLlm = True
+                    , llmReason = Just "ambiguous_phrase"
+                    , triageDetails = [AmbiguousPhrase "condition" ["as-is"]]
+                    , parserConfidence = High
+                    , confidenceScore = 0.8
+                    }
         ]
 
 jsonRoundtrip :: (Eq a, Show a, ToJSON a, FromJSON a) => a -> IO ()
@@ -149,15 +155,15 @@ configTests :: AppConfig -> TestTree
 configTests cfg =
     testGroup
         "Config"
-        [ testCase "loads abbreviations" $
-            assertBool "wordReplacements should be non-empty" $
-                not (null (wordReplacements (abbreviationConfig cfg)))
-        , testCase "loads parser specs" $
-            assertBool "parserSpecs should be non-empty" $
-                not (null (parserSpecs cfg))
-        , testCase "loads at least 5 parser specs" $
-            assertBool "expected at least 5 specs" $
-                length (parserSpecs cfg) >= 5
+        [ testCase "loads abbreviations"
+            $ assertBool "wordReplacements should be non-empty"
+            $ not (null (wordReplacements (abbreviationConfig cfg)))
+        , testCase "loads parser specs"
+            $ assertBool "parserSpecs should be non-empty"
+            $ not (null (parserSpecs cfg))
+        , testCase "loads at least 5 parser specs"
+            $ assertBool "expected at least 5 specs"
+            $ length (parserSpecs cfg) >= 5
         , testCase "triage config has reasonable thresholds" $ do
             let tc = triageConfig cfg
             tcLongNoSignalThreshold tc @?= 40
@@ -191,7 +197,41 @@ parserSpecTests =
                 case validateSpec (validVerbalSpec {psActionVerbs = []}) of
                     Left _ -> True
                     Right _ -> False
+        , testCase "blank phrase fails"
+            $ assertLeft
+            $ validateSpec validPhraseSpec {psEntries = [defSpecEntry {seTag = "Tag", sePhrases = ["ok", ""]}]}
+        , testCase "whitespace-only bridge fails"
+            $ assertLeft
+            $ validateSpec
+                validPhraseSpec
+                    { psStrategy = MonetaryStrategy
+                    , psEntries = [defSpecEntry {seTag = "Fee", seLabels = ["fee"], seBridges = ["  "]}]
+                    }
+        , testCase "blank tag fails for a non-verbal strategy"
+            $ assertLeft
+            $ validateSpec validPhraseSpec {psEntries = [defSpecEntry {sePhrases = ["phrase one"]}]}
         ]
+
+assertLeft :: Either String () -> Assertion
+assertLeft = \case
+    Left _ -> pure ()
+    Right () -> assertFailure "expected validation to fail"
+
+-- All-empty SpecEntry; tests set only the fields under test via record update.
+defSpecEntry :: SpecEntry
+defSpecEntry =
+    SpecEntry
+        { seTag = ""
+        , sePhrases = []
+        , seSynonyms = []
+        , seSuffixExtra = []
+        , seTriggers = []
+        , seLabels = []
+        , seBridges = []
+        , seFrequency = []
+        , seTerminators = ""
+        , seDirectPhrases = []
+        }
 
 validPhraseSpec :: ParserSpec
 validPhraseSpec =
@@ -199,14 +239,14 @@ validPhraseSpec =
         { psVersion = 1
         , psCategory = "test"
         , psStrategy = PhraseStrategy
-        , psEntries = [SpecEntry "Tag" ["phrase one"] [] [] [] [] [] [] "" []]
+        , psEntries = [defSpecEntry {seTag = "Tag", sePhrases = ["phrase one"]}]
         , psAdverbs = []
         , psActionVerbs = []
         , psSuffixVerbs = []
         }
 
 emptyPhraseSpec :: ParserSpec
-emptyPhraseSpec = validPhraseSpec {psEntries = [SpecEntry "Tag" [] [] [] [] [] [] [] "" []]}
+emptyPhraseSpec = validPhraseSpec {psEntries = [defSpecEntry {seTag = "Tag"}]}
 
 validVerbalSpec :: ParserSpec
 validVerbalSpec =
@@ -214,7 +254,7 @@ validVerbalSpec =
         { psVersion = 1
         , psCategory = "test"
         , psStrategy = VerbalStrategy
-        , psEntries = [SpecEntry "Tag" [] ["synonym"] [] [] [] [] [] "" []]
+        , psEntries = [defSpecEntry {seTag = "Tag", seSynonyms = ["synonym"]}]
         , psAdverbs = ["recently"]
         , psActionVerbs = ["inspected"]
         , psSuffixVerbs = ["inspected"]
@@ -266,6 +306,14 @@ pipelineTests cfg =
                 let result = runPipeline cfg "shipping cost $25.99"
                 assertHasCategory "cost" result
                 assertHasAmountValue "cost" 25.99 result
+            , testCase "frequency suffix after the amount" $
+                assertHasAmountValue "cost" 500.0 (runPipeline cfg "maintenance fee $500 per month")
+            , testCase "text after the amount that is not a frequency" $
+                assertHasAmountValue "cost" 500.0 (runPipeline cfg "maintenance fee $500 for the year")
+            , testCase "bridge word between label and amount" $
+                assertHasAmountValue "cost" 500.0 (runPipeline cfg "maintenance fee is $500")
+            , testCase "sentence period after the amount" $
+                assertHasAmountValue "cost" 25.0 (runPipeline cfg "shipping cost $25. thanks")
             ]
         , testGroup
             "Capture strategy"
@@ -278,6 +326,23 @@ pipelineTests cfg =
             , testCase "captures storage note" $ do
                 let result = runPipeline cfg "store in cool dry place."
                 assertHasCategory "note" result
+            , testCase "trigger does not fire inside a longer word" $ do
+                -- "store in" must not match the start of "store information".
+                let result = runPipeline cfg "store information sheet."
+                assertNoCategory "note" result
+            , testCase "capture stops at a line break" $
+                extractedValues "note" (runPipeline cfg "special instructions keep frozen\nship on monday")
+                    @?= [CapturedText "keep frozen"]
+            , testCase "capture stops at a single exclamation mark" $
+                extractedValues "note" (runPipeline cfg "fragile handle gently! ship on monday")
+                    @?= [CapturedText "handle gently"]
+            ]
+        , testGroup
+            "Plural forms"
+            [ testCase "a plural matches its singular literal" $
+                assertHasTagValue "category" "Electronics" (runPipeline cfg "two electronic devices")
+            , testCase "a plural does not match inside a longer word" $
+                assertNoCategory "category" (runPipeline cfg "electronic devicesss")
             ]
         , testGroup
             "Verbal strategy"
@@ -295,7 +360,10 @@ pipelineTests cfg =
                 assertHasTag "activity" "Warehouse" result
             , testCase "matches with year" $ do
                 let result = runPipeline cfg "inspected warehouse in 2021"
-                assertHasCategory "activity" result
+                assertBool "expected Warehouse with year 2021" $
+                    TagWithYear "Warehouse" (Just 2021) `elem` extractedValues "activity" result
+            , testCase "serviced works as a suffix verb" $
+                assertHasTag "activity" "Equipment" (runPipeline cfg "equipment serviced")
             ]
         , testGroup
             "Negation"
@@ -305,13 +373,19 @@ pipelineTests cfg =
             , testCase "not negated phrase still matches" $ do
                 let result = runPipeline cfg "has electronics"
                 assertHasCategory "category" result
+            , testCase "negation does not cross a sentence break" $
+                assertHasCategory "category" (runPipeline cfg "no damage. electronics on site")
+            , testCase "negation does not cross a line break" $
+                assertHasCategory "category" (runPipeline cfg "no damage\nelectronics on site")
+            , testCase "negation still reaches across a comma" $
+                assertNoCategory "category" (runPipeline cfg "no tools, electronics")
             ]
         , testGroup
             "Normalization"
             [ testCase "abbreviations are expanded before matching" $ do
-                -- "qty" should be expanded to "quantity" by abbreviation config
+                -- "qty" expands to "quantity" per config/abbreviations.lua
                 let result = runPipeline cfg "qty of electronics in stock"
-                -- the abbreviation expansion should not prevent electronics from matching
+                unCleanedText (prCleanedText (prResult result)) @?= "quantity of electronics in stock"
                 assertHasCategory "category" result
             ]
         , testGroup
@@ -323,12 +397,26 @@ pipelineTests cfg =
                 let cleaned = unCleanedText (prCleanedText (prResult result))
                 assertBool "phone should be stripped" $
                     not (T.isInfixOf "555-123-4567" cleaned)
-            , testCase "emails are masked" $ do
+            , testCase "emails are deleted" $ do
                 let result = runPipeline cfg "contact user@example.com about electronics"
                 assertHasCategory "category" result
                 let cleaned = unCleanedText (prCleanedText (prResult result))
-                assertBool "email should be masked" $
+                assertBool "email should be deleted" $
                     not (T.isInfixOf "user@example.com" cleaned)
+            , testCase "phone number with no separators is stripped" $
+                cleanedOf cfg "call 5551234567 today" @?= "call today"
+            , testCase "phone number with space separators is stripped" $
+                cleanedOf cfg "call 555 123 4567 today" @?= "call today"
+            , testCase "ten digits inside a longer number are kept" $
+                cleanedOf cfg "serial 155512345678 here" @?= "serial 155512345678 here"
+            , testCase "phone number with a parenthesized area code is stripped" $
+                cleanedOf cfg "call (555) 123-4567 today" @?= "call today"
+            , testCase "parenthesized area code with no space is stripped" $
+                cleanedOf cfg "call (555)123-4567 today" @?= "call today"
+            , testCase "line breaks survive as one newline" $
+                cleanedOf cfg "electronics \n\n  furniture" @?= "electronics\nfurniture"
+            , testCase "a single exclamation mark is kept, a run collapses" $
+                cleanedOf cfg "fragile! very fragile!!!" @?= "fragile! very fragile!"
             ]
         , testGroup
             "Multiple extractions"
@@ -367,21 +455,41 @@ triageTests cfg =
             assertBool "confidence score should be positive" $
                 confidenceScore ext > 0
         , testCase "ambiguous phrase triggers flag" $ do
-            -- "as-is" is in the triage config ambiguous phrases for "condition"
-            let result = runPipeline cfg "the property is sold as-is with no warranties"
-            let ext = extraction result
-            -- Check if ambiguous phrase was detected
-            let _hasAmbig = any isAmbiguousPhrase (triageDetails ext)
-            -- it's okay if not flagged when there are enough features;
-            -- we just verify the pipeline doesn't crash on ambiguous input
-            assertBool "pipeline should handle ambiguous input" True
+            -- "assorted" is in the triage config's ambiguous phrases for "category"
+            let ext = extraction (runPipeline cfg "pallet of assorted goods")
+            triageDetails ext @?= [AmbiguousPhrase "category" ["assorted"]]
+            needsLlm ext @?= True
+        , testCase "watch words flag a remark the parsers missed" $ do
+            let ext = extraction (runPipeline cfg "laptop, tablet, monitor and printer on the dock")
+            assertBool "expected a HighVocabNoExtraction detail for category" $
+                HighVocabNoExtraction "category" 4 ["laptop", "tablet", "monitor", "printer"]
+                    `elem` triageDetails ext
         , testCase "conflicting tags trigger flag" $ do
-            -- The triage config has conflicting pairs for "condition"
-            -- with positive=["Excellent","Good"] and negative=["Fair","Poor"]
-            -- These come from parsers, so we need text that produces both
-            -- For now just verify the pipeline handles it
-            assertBool "pipeline should handle conflicting signals" True
+            let tcfg = emptyTriageConfig {tcConflictingTagPairs = [("condition", ["Good"], ["Poor"])]}
+                ext = emptyExtraction {categories = Map.singleton "condition" [TagValue "Good", TagValue "Poor"]}
+                details = triageDetails (triage tcfg (CleanedText "good and poor") ext)
+            details @?= [ConflictingTags "condition" ["Good"] ["Poor"]]
+        , testCase "watch words count through trailing punctuation" $ do
+            let tcfg =
+                    emptyTriageConfig
+                        { tcVocabWatchLists = [("renovation", ["roof", "hvac", "kitchen", "bath"])]
+                        , tcVocabThreshold = 3
+                        }
+                details = triageDetails (triage tcfg (CleanedText "roof, hvac, kitchen, bath") emptyExtraction)
+            details @?= [HighVocabNoExtraction "renovation" 4 ["roof", "hvac", "kitchen", "bath"]]
         ]
+
+-- | A triage config under which no rule can fire; tests switch one rule on.
+emptyTriageConfig :: TriageConfig
+emptyTriageConfig =
+    TriageConfig
+        { tcAmbiguousPhrases = []
+        , tcVocabWatchLists = []
+        , tcConflictingTagPairs = []
+        , tcLongNoSignalThreshold = 1000
+        , tcVocabThreshold = 1000
+        , tcUnrecognizableRatioThreshold = 1.0
+        }
 
 -- ---------------------------------------------------------------------------
 -- CSV building tests
@@ -390,39 +498,50 @@ triageTests cfg =
 csvBuildTests :: AppConfig -> TestTree
 csvBuildTests cfg =
     testGroup
-        "IO.Csv buildCsvRows"
-        [ testCase "produces extraction row for every input" $ do
-            let rows = [InputRow "1" "electronics", InputRow "2" "furniture"]
-            let results = map (\r -> (r, processRemarkPure cfg (rowText r))) rows
-            let (exRows, _) = buildCsvRows "2024-01-01" results
-            length exRows @?= 2
-        , testCase "extraction row has correct id" $ do
+        "IO.Csv rows"
+        [ testCase "extraction row has correct id and timestamp" $ do
             let row = InputRow "test-42" "electronics"
-            let result = processRemarkPure cfg (rowText row)
-            let (exRows, _) = buildCsvRows "2024-01-01" [(row, result)]
-            case exRows of
-                (r : _) -> erRowId r @?= "test-42"
-                [] -> assertFailure "expected at least one extraction row"
-        , testCase "flagged row produces review row" $ do
-            let longText = T.unwords (replicate 50 "unremarkable")
-            let row = InputRow "1" longText
-            let result = processRemarkPure cfg (rowText row)
-            let (_, revRows) = buildCsvRows "2024-01-01" [(row, result)]
-            assertBool "should produce a review row for flagged input" $
-                not (null revRows)
+                er = toExtractionRow "2024-01-01" row (processRemarkPure cfg (rowText row))
+            erRowId er @?= "test-42"
+            erParsedAt er @?= "2024-01-01"
+        , testCase "flagged row produces review row with matching id" $ do
+            let row = InputRow "rev-1" (T.unwords (replicate 50 "unremarkable"))
+                result = processRemarkPure cfg (rowText row)
+            fmap rrRowId (toReviewRow row result) @?= Just "rev-1"
         , testCase "unflagged row produces no review row" $ do
             let row = InputRow "1" "electronics"
-            let result = processRemarkPure cfg (rowText row)
-            let (_, revRows) = buildCsvRows "2024-01-01" [(row, result)]
-            null revRows @?= True
-        , testCase "review row has matching id" $ do
-            let longText = T.unwords (replicate 50 "unremarkable")
-            let row = InputRow "rev-1" longText
-            let result = processRemarkPure cfg (rowText row)
-            let (_, revRows) = buildCsvRows "2024-01-01" [(row, result)]
-            case revRows of
-                (r : _) -> rrRowId r @?= "rev-1"
-                [] -> assertFailure "expected a review row"
+            isJust (toReviewRow row (processRemarkPure cfg (rowText row))) @?= False
+        , testCase "review row carries the plain cleaned text" $ do
+            let row = InputRow "rev-2" (T.unwords (replicate 50 "unremarkable"))
+                result = processRemarkPure cfg (rowText row)
+            fmap rrRemarksClean (toReviewRow row result) @?= Just (unCleanedText (prCleanedText result))
+        , testCase "withCsvOutput writes header and rows, leaving no partial file" $
+            withSystemTempDirectory "chompsky-csv" $ \dir -> do
+                let path = dir </> "out.csv"
+                    row = InputRow "1" "electronics"
+                withCsvOutput path $ \write ->
+                    write (toExtractionRow "t" row (processRemarkPure cfg (rowText row)))
+                written <- TIO.readFile path
+                take 1 (T.lines written) @?= ["id,extraction_json,needs_llm,confidence,confidence_score,parsed_at\r"]
+                length (T.lines written) @?= 2
+                files <- listDirectory dir
+                files @?= ["out.csv"]
+        , testCase "withCsvOutput leaves the old file and removes the partial on failure" $
+            withSystemTempDirectory "chompsky-csv" $ \dir -> do
+                let path = dir </> "out.csv"
+                    row = InputRow "1" "electronics"
+                TIO.writeFile path "previous run\n"
+                outcome <-
+                    try $ withCsvOutput path $ \write -> do
+                        write (toExtractionRow "t" row (processRemarkPure cfg (rowText row)))
+                        throwIO (ChompskyError "mid-run failure")
+                case outcome of
+                    Left (ChompskyError _) -> pure ()
+                    Right () -> assertFailure "expected the failure to propagate"
+                kept <- TIO.readFile path
+                kept @?= "previous run\n"
+                files <- listDirectory dir
+                files @?= ["out.csv"]
         ]
 
 -- ---------------------------------------------------------------------------
@@ -450,6 +569,12 @@ csvInputTests =
         , testCase "readInputCsvLimit with limit larger than file" $ withTestCsv $ \path -> do
             rows <- readInputCsvLimit path 100
             length rows @?= 3
+        , testCase "leading byte-order mark is ignored" $
+            withSystemTempDirectory "chompsky-test" $ \dir -> do
+                let path = dir </> "bom.csv"
+                BL.writeFile path "\xEF\xBB\xBFid,text\n1,first remark\n"
+                rows <- readInputCsv path
+                map rowId rows @?= ["1"]
         ]
 
 withTestCsv :: (FilePath -> IO ()) -> IO ()
@@ -467,10 +592,20 @@ fuzzyTests :: TestTree
 fuzzyTests =
     testGroup
         "Fuzzy confidence"
-        [ testCase "many features, no ambiguity → Medium" $ do
+        [ testCase "many features, no ambiguity → High" $ do
             let (score, tier) = fuzzyConfidence 8 0
-            tier @?= Medium
-            assertBool "score should be >= 0.35" (score >= 0.35)
+            tier @?= High
+            assertBool "score should be >= 0.65" (score >= 0.65)
+        , testCase "some features, no ambiguity → High" $
+            snd (fuzzyConfidence 3 0) @?= High
+        , testCase "features at the clamp ceiling stay High" $ do
+            snd (fuzzyConfidence 10 0) @?= High
+            snd (fuzzyConfidence 50 0) @?= High
+        , testCase "nothing extracted, no ambiguity → Low" $
+            snd (fuzzyConfidence 0 0) @?= Low
+        , testCase "nothing extracted never outscores one feature"
+            $ assertBool "0 features with flags should not beat 1 feature"
+            $ fst (fuzzyConfidence 0 2) <= fst (fuzzyConfidence 1 1)
         , testCase "some features, mild ambiguity → Medium" $ do
             let (score, tier) = fuzzyConfidence 3 1
             tier @?= Medium
@@ -536,6 +671,10 @@ traceTests cfg =
                                 && shNegationWord h == Just "no"
                         )
                         (ptScanHits pt)
+            , testCase "curly-apostrophe contraction negates" $ do
+                let pt = processRemarkTraced cfg "we don\x2019t have electronics"
+                map shNegationWord (filter ((== "category") . shCategory) (ptScanHits pt))
+                    @?= [Just "don\x2019t"]
             , testCase "negated match is filtered from the final Extraction" $ do
                 let pt = processRemarkTraced cfg "no electronics here"
                 Map.member "category" (categories (ptScanned pt)) @?= False
@@ -594,7 +733,38 @@ traceTests cfg =
                     (e : _) -> teBefore e @?= "all data subject to verification"
                     [] -> assertFailure "expected a BoilerplateStripped edit"
             ]
+        , testGroup
+            "edit-log replay"
+            [ testCase (T.unpack input) $ do
+                let pt = processRemarkTraced cfg input
+                replayEdits (ptNormalizeEdits pt) (T.toLower input) @?= Right (ptNormalized pt)
+                replayEdits (ptCleanEdits pt) (T.toLower (ptNormalized pt))
+                    @?= Right (unCleanedText (ptCleaned pt))
+            | input <-
+                [ "qty pcs"
+                , "  electronics  "
+                , "temp controlled whse qty pcs"
+                , "call 555-123-4567 or 555.987.6543 about electronics"
+                , "call (555) 123-4567 about\n\n electronics"
+                , "mail a@b.com and c@d.org about inv!!! and   maint ***"
+                , "electronics installed last year here some padding, all data subject to verification"
+                ]
+            ]
         ]
+
+{- | Apply edits in order. Each edit's span must locate its 'teBefore' in the
+text as it stands at that point; a mismatch is reported rather than applied.
+-}
+replayEdits :: [TextEdit] -> Text -> Either String Text
+replayEdits edits t0 = foldl step (Right t0) edits
+    where
+        step acc e = acc >>= apply e
+        apply e t =
+            let Span s end = teSpan e
+                found = T.take (end - s) (T.drop s t)
+             in if found == teBefore e
+                    then Right (T.take s t <> teAfter e <> T.drop end t)
+                    else Left (show (teKind e) <> " at " <> show (s, end) <> " found " <> show found)
 
 -- ---------------------------------------------------------------------------
 -- Parser.Build: stable entry IDs
@@ -610,14 +780,14 @@ parserBuildTests =
                         { psVersion = 1
                         , psCategory = "fruit"
                         , psStrategy = PhraseStrategy
-                        , psEntries = [SpecEntry "apple" ["apple"] [] [] [] [] [] [] "" []]
+                        , psEntries = [defSpecEntry {seTag = "apple", sePhrases = ["apple"]}]
                         , psAdverbs = []
                         , psActionVerbs = []
                         , psSuffixVerbs = []
                         }
             map seId (allEntries [spec]) @?= ["fruit/apple"]
         , testCase "duplicate tags get #N suffix (2-based)" $ do
-            let mkEntry t = SpecEntry t [t] [] [] [] [] [] [] "" []
+            let mkEntry t = defSpecEntry {seTag = t, sePhrases = [t]}
                 spec =
                     ParserSpec
                         { psVersion = 1
@@ -636,15 +806,37 @@ parserBuildTests =
                         , psCategory = "fruit"
                         , psStrategy = PhraseStrategy
                         , psEntries =
-                            [ SpecEntry "apple" ["apple"] [] [] [] [] [] [] "" []
-                            , SpecEntry "pear" ["pear"] [] [] [] [] [] [] "" []
+                            [ defSpecEntry {seTag = "apple", sePhrases = ["apple"]}
+                            , defSpecEntry {seTag = "pear", sePhrases = ["pear"]}
                             ]
                         , psAdverbs = []
                         , psActionVerbs = []
                         , psSuffixVerbs = []
                         }
             map seId (allEntries [spec]) @?= ["fruit/apple", "fruit/pear"]
+        , testCase "two entries with the same tag give two hits with different IDs" $ do
+            let spec =
+                    fruitSpec
+                        [ defSpecEntry {seTag = "apple", sePhrases = ["apple"]}
+                        , defSpecEntry {seTag = "apple", sePhrases = ["apple pie"]}
+                        ]
+            map shEntryId (scanHits (allEntries [spec]) "apple pie")
+                @?= ["fruit/apple", "fruit/apple#2"]
+        , testCase "the longest literal wins whatever the config order" $ do
+            let spec = fruitSpec [defSpecEntry {seTag = "pie", sePhrases = ["apple", "apple pie"]}]
+            map shSpan (scanHits (allEntries [spec]) "apple pie") @?= [Span 0 9]
         ]
+    where
+        fruitSpec entries =
+            ParserSpec
+                { psVersion = 1
+                , psCategory = "fruit"
+                , psStrategy = PhraseStrategy
+                , psEntries = entries
+                , psAdverbs = []
+                , psActionVerbs = []
+                , psSuffixVerbs = []
+                }
 
 -- ---------------------------------------------------------------------------
 -- TUI state transitions
@@ -677,12 +869,13 @@ tuiStateTests =
             tsHighConf st3 @?= 1
             tsMedConf st3 @?= 1
             tsLowConf st3 @?= 1
-        , testCase "CsvWriteStarted moves to Writing" $ do
-            let st = updateState fixedTime CsvWriteStarted initialState
-            tsPhase st @?= Writing
         , testCase "BackfillFinished marks Done and finished" $ do
             let st = updateState fixedTime BackfillFinished initialState
             tsPhase st @?= Done
+            tsFinished st @?= True
+        , testCase "BackfillFailed marks Failed and finished" $ do
+            let st = updateState fixedTime (BackfillFailed "boom") initialState
+            tsPhase st @?= Failed "boom"
             tsFinished st @?= True
         ]
 
@@ -698,8 +891,8 @@ tuiWidgetsTests =
             formatElapsed 0 @?= "00:00"
             formatElapsed 65 @?= "01:05"
             formatElapsed 3599 @?= "59:59"
-        , testCase "formatRate returns em-dash until elapsed > 0" $
-            formatRate 100 0 @?= "\x2014"
+        , testCase "formatRate returns a dash until elapsed > 0" $
+            formatRate 100 0 @?= "-"
         , testCase "formatRate reports rows/sec with no decimals" $
             formatRate 100 10 @?= "10 rows/sec"
         , testCase "formatEta returns --- until 5 items processed" $ do
@@ -724,29 +917,32 @@ workersTests :: AppConfig -> TestTree
 workersTests cfg =
     testGroup
         "IO.Workers.processStreaming"
-        [ testCase "preserves input row order in results" $ do
+        [ testCase "calls back in input row order" $ do
             let rows =
                     [ InputRow "a" "electronics"
                     , InputRow "b" "qty of pcs"
                     , InputRow "c" "no electronics"
                     ]
-            results <- processStreaming cfg (`mapM_` rows) (\_ _ -> pure ())
-            map (rowId . fst) results @?= ["a", "b", "c"]
+            seenRef <- newIORef []
+            processStreaming cfg (`mapM_` rows) (\row _ -> modifyIORef' seenRef (rowId row :))
+            seen <- readIORef seenRef
+            reverse seen @?= ["a", "b", "c"]
         , testCase "invokes callback once per row" $ do
             let rows = [InputRow (T.pack (show i)) "electronics" | i <- [1 .. 5 :: Int]]
             counter <- newIORef (0 :: Int)
-            _ <- processStreaming cfg (`mapM_` rows) (\_ _ -> modifyIORef' counter (+ 1))
+            processStreaming cfg (`mapM_` rows) (\_ _ -> modifyIORef' counter (+ 1))
             n <- readIORef counter
             n @?= 5
-        , testCase "empty input yields empty results" $ do
-            results <- processStreaming cfg (\_ -> pure ()) (\_ _ -> pure ())
-            length results @?= 0
+        , testCase "empty input never calls back" $ do
+            counter <- newIORef (0 :: Int)
+            processStreaming cfg (\_ -> pure ()) (\_ _ -> modifyIORef' counter (+ 1))
+            n <- readIORef counter
+            n @?= 0
         , testCase "callback receives matching row and extraction" $ do
             let rows = [InputRow "only" "electronics"]
             seenRef <- newIORef []
-            _ <-
-                processStreaming cfg (`mapM_` rows) $ \row result ->
-                    modifyIORef' seenRef ((rowId row, categories (prExtraction result)) :)
+            processStreaming cfg (`mapM_` rows) $ \row result ->
+                modifyIORef' seenRef ((rowId row, categories (prExtraction result)) :)
             seen <- readIORef seenRef
             case seen of
                 [(rid, cats)] -> do
@@ -773,6 +969,118 @@ cliTests =
             n @?= 1
         ]
 
+backfillTests :: AppConfig -> TestTree
+backfillTests cfg =
+    testGroup
+        "CLI backfill worker"
+        [ testCase "input without a text column throws and never finishes" $
+            withSystemTempDirectory "chompsky-test" $ \dir -> do
+                let input = dir </> "in.csv"
+                BL.writeFile input "id,remark\n1,electronics\n"
+                (events, outcome) <- runWorker (backfillOptsIn dir input)
+                case outcome of
+                    Left (ChompskyError _) -> pure ()
+                    Right () -> assertFailure "expected the worker to throw"
+                assertBool "worker must not report BackfillFinished" (BackfillFinished `notElem` events)
+        , testCase "writes both files and finishes" $
+            withSystemTempDirectory "chompsky-test" $ \dir -> do
+                let input = dir </> "in.csv"
+                    opts = backfillOptsIn dir input
+                BL.writeFile input "id,text\n1,electronics\n"
+                (events, outcome) <- runWorker opts
+                either (\(ChompskyError msg) -> assertFailure msg) pure outcome
+                lastMaybe events @?= Just BackfillFinished
+                extractions <- TIO.readFile (bfOutput opts)
+                -- parsed_at is the last column, and an ISO-8601 time has no comma.
+                case T.lines extractions of
+                    [_header, dataLine] -> do
+                        let parsedAt = T.strip (last (T.splitOn "," dataLine))
+                        assertBool ("parsed_at should be ISO-8601: " <> T.unpack parsedAt) $
+                            isJust (iso8601ParseM (T.unpack parsedAt) :: Maybe UTCTime)
+                    other -> assertFailure ("expected a header and one row, got " <> show other)
+                reviews <- BL.readFile (bfReviews opts)
+                reviews @?= "id,remarks_clean,triage_reason,triage_details,partial_extraction\r\n"
+        ]
+    where
+        backfillOptsIn dir input =
+            BackfillOpts {bfInput = input, bfOutput = dir </> "out.csv", bfReviews = dir </> "reviews.csv"}
+        runWorker opts = do
+            ref <- newIORef []
+            outcome <- try (backfillWorker cfg opts (\ev -> modifyIORef' ref (ev :)))
+            events <- reverse <$> readIORef ref
+            pure (events, outcome)
+        lastMaybe xs = if null xs then Nothing else Just (last xs)
+
+-- ---------------------------------------------------------------------------
+-- Config sandbox and validation
+-- ---------------------------------------------------------------------------
+
+configSandboxTests :: TestTree
+configSandboxTests =
+    testGroup
+        "Config sandbox"
+        [ testCase "the shipped config loads" $ do
+            dir <- (</> "config") <$> getCurrentDirectory
+            _ <- loadConfig dir
+            pure ()
+        , testCase "abbreviations.lua cannot reach the standard library" $
+            assertConfigRejected "abbreviations.lua" "os.exit(1)\nreturn { words = {}, phrases = {} }"
+        , testCase "triage.lua cannot call print" $
+            assertConfigRejected "triage.lua" "print(\"hi\")\nreturn {}"
+        , testCase "blank boilerplate phrase is rejected" $
+            assertConfigRejected "boilerplate.lua" "return { min_position = 0, phrases = { \"\" } }"
+        , testCase "blank abbreviation key is rejected" $
+            assertConfigRejected
+                "abbreviations.lua"
+                "return { words = {}, phrases = { { match = \"\", replace = \"x\" } } }"
+        , testCase "a config that loops is stopped" $
+            assertConfigRejected "boilerplate.lua" "while true do end\nreturn { min_position = 0, phrases = {} }"
+        , testCase "a misspelled top-level key is rejected" $
+            assertConfigRejected "boilerplate.lua" "return { min_postion = 0, phrases = {} }"
+        , testCase "a misspelled triage entry key is rejected" $
+            assertConfigRejected
+                "triage.lua"
+                "return { ambiguous_phrases = { { category = \"c\", phrase = { \"x\" } } },\
+                \ vocab_watch_lists = {}, conflicting_tag_pairs = {}, long_no_signal_threshold = 40,\
+                \ vocab_threshold = 3, unrecognizable_ratio_threshold = 0.3 }"
+        , testCase "a misspelled parser spec entry key is rejected" $
+            assertConfigRejected
+                "parsers/cost.lua"
+                "return { version = 1, category = \"cost\", strategy = \"monetary\",\
+                \ entries = { { tag = \"Fee\", labels = { \"fee\" }, bridge = { \"is\" } } } }"
+        , testCase "an unsupported parser spec version is rejected" $
+            assertConfigRejected
+                "parsers/cost.lua"
+                "return { version = 2, category = \"cost\", strategy = \"monetary\",\
+                \ entries = { { tag = \"Fee\", labels = { \"fee\" } } } }"
+        , testCase "uppercase abbreviation keys still expand" $
+            withConfigOverride "abbreviations.lua" "return { words = { QTY = \"quantity\" }, phrases = {} }" $ \dir -> do
+                cfg <- loadConfig dir
+                unCleanedText (prCleanedText (processRemarkPure cfg "qty")) @?= "quantity"
+        ]
+
+-- | Copy the shipped config into a temp dir, replace one file, and run the action on it.
+withConfigOverride :: FilePath -> BL.ByteString -> (FilePath -> IO ()) -> IO ()
+withConfigOverride name contents action =
+    withSystemTempDirectory "chompsky-config" $ \tmp -> do
+        src <- (</> "config") <$> getCurrentDirectory
+        let dst = tmp </> "config"
+        createDirectoryIfMissing True (dst </> "parsers")
+        topFiles <- filter (".lua" `isSuffixOf`) <$> listDirectory src
+        mapM_ (\f -> copyFile (src </> f) (dst </> f)) topFiles
+        parserFiles <- listDirectory (src </> "parsers")
+        mapM_ (\f -> copyFile (src </> "parsers" </> f) (dst </> "parsers" </> f)) parserFiles
+        BL.writeFile (dst </> name) contents
+        action dst
+
+assertConfigRejected :: FilePath -> BL.ByteString -> Assertion
+assertConfigRejected name contents =
+    withConfigOverride name contents $ \dir -> do
+        outcome <- try (loadConfig dir)
+        case outcome of
+            Left (_ :: Lua.Exception) -> pure ()
+            Right _ -> assertFailure ("expected " <> name <> " to be rejected")
+
 -- ---------------------------------------------------------------------------
 -- Scanner round-trip: hitsToExtraction . scanHits == fst . scanAll
 -- ---------------------------------------------------------------------------
@@ -784,22 +1092,17 @@ scanRoundTripTests cfg =
         [ testCase (T.unpack label) $ do
             let entries = allEntries (parserSpecs cfg)
                 hits = scanHits entries input
-                fromHits = hitsToExtraction entries hits
+                fromHits = hitsToExtraction hits
                 fromAll = fst (scanAll entries input)
-            -- Merge order for Concatenate may vary between the two paths; compare
-            -- categories as sets to stay robust against order differences.
-            normaliseExtraction fromHits @?= normaliseExtraction fromAll
+            categories fromHits @?= categories fromAll
         | (label, input) <-
             [ ("electronics only", "electronics")
             , ("negated", "no electronics here")
-            , ("multi-category", "electronics installed in 2020 for $500")
+            , ("multi-category", "electronics acquired in 2020 maintenance fee $500 per month")
             , ("empty", "")
             , ("no match", "nothing parsable here")
             ]
         ]
-
-normaliseExtraction :: Extraction -> Map.Map Text [ExtractedValue]
-normaliseExtraction = fmap sort . categories
 
 -- ---------------------------------------------------------------------------
 -- ProcessTrace JSON schema: pin the top-level key set fugue depends on.
@@ -904,6 +1207,9 @@ assertHasAmountValue cat amt pr =
     assertBool ("expected AmountValue " <> show amt <> " in " <> T.unpack cat) $
         any (isAmountClose amt) (extractedValues cat pr)
 
+cleanedOf :: AppConfig -> Text -> Text
+cleanedOf cfg = unCleanedText . prCleanedText . processRemarkPure cfg
+
 hasTag :: Text -> ExtractedValue -> Bool
 hasTag t (TagValue v) = v == t
 hasTag t (TagWithYear v _) = v == t
@@ -920,7 +1226,3 @@ isAmountClose _ _ = False
 isLongNoSignal :: TriageDetail -> Bool
 isLongNoSignal (LongNoSignal {}) = True
 isLongNoSignal _ = False
-
-isAmbiguousPhrase :: TriageDetail -> Bool
-isAmbiguousPhrase (AmbiguousPhrase {}) = True
-isAmbiguousPhrase _ = False

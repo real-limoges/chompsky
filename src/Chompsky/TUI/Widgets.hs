@@ -56,7 +56,7 @@ formatPct n total
 
 formatRate :: Int -> Double -> String
 formatRate processed elapsed
-    | elapsed <= 0 = "—"
+    | elapsed <= 0 = "-"
     | otherwise =
         let rate = fromIntegral processed / elapsed :: Double
          in showFFloat (Just 0) rate "" <> " rows/sec"

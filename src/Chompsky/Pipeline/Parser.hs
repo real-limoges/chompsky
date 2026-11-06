@@ -9,6 +9,9 @@ import Chompsky.Config.ParserSpec (ParserSpec)
 import Chompsky.Pipeline.Parser.Build (buildEntries)
 import Chompsky.Pipeline.Parser.Internal (Parser, ScannerEntry (..))
 
--- | Order of entries does not affect correctness — each scans the full text independently.
+{- | Order of entries does not affect which values are extracted, since each
+entry scans the full text independently. It does set the order of
+'Chompsky.Types.ScanHit's in a trace, which is why spec files load sorted.
+-}
 allEntries :: [ParserSpec] -> [ScannerEntry]
 allEntries = concatMap buildEntries

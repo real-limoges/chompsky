@@ -1,66 +1,65 @@
 -- Triage configuration: word lists, thresholds, and conflict rules.
 -- All domain-specific triage data lives here, not in Haskell code.
+-- Categories named here should be ones the parsers in parsers/ emit.
 
 return {
-    -- Phrases that signal an ambiguous condition without stating it explicitly.
+    -- Phrases that make a remark ambiguous for a category: the text talks about
+    -- the category without saying anything a parser can pin down.
     -- Each entry: { category = "...", phrases = { "...", ... } }
     ambiguous_phrases = {
         {
-            category = "condition",
+            category = "category",
             phrases = {
-                "opportunity",
-                "handyman",
-                "fixer",
-                "tlc",
-                "as-is",
-                "as is",
-                "cosmetic",
-                "needs work",
-                "needs updating",
-                "needs some tlc",
-                "deferred maintenance",
-                "sweat equity",
-                "investor special",
-                "potential",
-                "bring your vision",
-                "make it your own",
-                "diamond in the rough",
-                "priced to sell",
-                "priced reflecting condition",
-                "priced to reflect",
-                "sold as-is where-is",
+                "miscellaneous",
+                "misc",
+                "assorted",
+                "mixed lot",
+                "various items",
+                "odds and ends",
+                "sundries",
+                "general merchandise",
+            },
+        },
+        {
+            category = "cost",
+            phrases = {
+                "price on request",
+                "call for pricing",
+                "to be determined",
+                "tbd",
+                "negotiable",
             },
         },
     },
 
-    -- Vocabulary watch lists: flag when many words match but parser finds nothing.
+    -- Vocabulary watch lists: flag when many of a category's words appear but
+    -- its parser extracts nothing, which usually means the parser is missing a
+    -- phrase.
     -- Each entry: { category = "...", words = { "...", ... } }
     vocab_watch_lists = {
         {
-            category = "renovation",
+            category = "category",
             words = {
-                "roof", "hvac", "kitchen", "bath", "bathroom",
-                "window", "windows", "floor", "floors", "flooring",
-                "plumbing", "electrical", "paint", "painted",
-                "appliance", "appliances", "water", "heater",
-                "siding", "deck", "landscaping", "driveway",
-                "renovated", "renovation", "remodel", "remodeled",
-                "updated", "update", "replaced", "new",
-                "installed", "upgraded", "refinished",
-                "restored", "rebuilt", "repaired", "refurbished",
+                "laptop", "tablet", "phone", "monitor", "television", "printer",
+                "sofa", "couch", "chair", "desk", "table", "shelving", "cabinet",
+                "shirt", "jacket", "shoes", "uniform",
+                "produce", "dairy", "meat", "frozen", "refrigerated",
+            },
+        },
+        {
+            category = "activity",
+            words = {
+                "inspection", "audit", "count", "recount", "stocktake",
+                "walkthrough", "repair", "calibration", "servicing",
             },
         },
     },
 
-    -- Conflicting tag pairs: flag when both positive and negative tags appear.
+    -- Conflicting tag pairs: flag when a category holds a positive and a
+    -- negative tag at once. The shipped parsers emit no mutually exclusive
+    -- tags, so none are declared.
     -- Each entry: { category = "...", positive = { ... }, negative = { ... } }
-    conflicting_tag_pairs = {
-        {
-            category = "condition",
-            positive = { "Excellent", "Good" },
-            negative = { "Fair", "Poor" },
-        },
-    },
+    conflicting_tag_pairs = {},
 
     -- Word count above which a zero-feature remark is flagged.
     long_no_signal_threshold = 40,

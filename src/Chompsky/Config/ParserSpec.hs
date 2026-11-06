@@ -10,13 +10,12 @@ module Chompsky.Config.ParserSpec
     , validateSpec
     ) where
 
-import Data.List (isSuffixOf)
+import Data.List (isSuffixOf, sort)
 import Data.Text (Text)
 import Data.Text qualified as T
 import HsLua.Core qualified as Lua
 import HsLua.Marshalling
     ( Peeker
-    , forcePeek
     , liftLua
     , peekFieldRaw
     , peekIntegral
@@ -26,6 +25,8 @@ import HsLua.Marshalling
     )
 import System.Directory (listDirectory)
 import System.FilePath ((</>))
+
+import Chompsky.Config.Sandbox (loadSandboxed, peekKnownKeys)
 
 -- | How a parser spec entry assembles Megaparsec combinators.
 data ParserStrategy
@@ -70,7 +71,7 @@ data SpecEntry = SpecEntry
 data ParserSpec = ParserSpec
     { psVersion :: Int
     , psCategory :: Text
-    -- ^ @"amenity"@, @"condition"@, @"renovation"@, etc.
+    -- ^ @"category"@, @"activity"@, @"cost"@, etc.
     , psStrategy :: ParserStrategy
     , psEntries :: [SpecEntry]
     , psAdverbs :: [Text]
@@ -96,24 +97,48 @@ peekTextOrNil idx = do
         Lua.TypeNil -> pure ""
         _ -> peekText idx
 
+-- | The only version of the parser spec format.
+supportedVersion :: Int
+supportedVersion = 1
+
 peekSpecEntry :: Peeker Lua.Exception SpecEntry
 peekSpecEntry idx =
     retrieving "SpecEntry" $
-        SpecEntry
-            <$> peekFieldRaw peekText "tag" idx
-            <*> peekFieldRaw (peekListOrNil peekText) "phrases" idx
-            <*> peekFieldRaw (peekListOrNil peekText) "synonyms" idx
-            <*> peekFieldRaw (peekListOrNil peekText) "suffix_extra" idx
-            <*> peekFieldRaw (peekListOrNil peekText) "triggers" idx
-            <*> peekFieldRaw (peekListOrNil peekText) "labels" idx
-            <*> peekFieldRaw (peekListOrNil peekText) "bridges" idx
-            <*> peekFieldRaw (peekListOrNil peekText) "frequency" idx
-            <*> peekFieldRaw peekTextOrNil "terminators" idx
-            <*> peekFieldRaw (peekListOrNil peekText) "direct_phrases" idx
+        peekKnownKeys
+            [ "tag"
+            , "phrases"
+            , "synonyms"
+            , "suffix_extra"
+            , "triggers"
+            , "labels"
+            , "bridges"
+            , "frequency"
+            , "terminators"
+            , "direct_phrases"
+            ]
+            idx
+            *> ( SpecEntry
+                    <$> peekFieldRaw peekText "tag" idx
+                    <*> peekFieldRaw (peekListOrNil peekText) "phrases" idx
+                    <*> peekFieldRaw (peekListOrNil peekText) "synonyms" idx
+                    <*> peekFieldRaw (peekListOrNil peekText) "suffix_extra" idx
+                    <*> peekFieldRaw (peekListOrNil peekText) "triggers" idx
+                    <*> peekFieldRaw (peekListOrNil peekText) "labels" idx
+                    <*> peekFieldRaw (peekListOrNil peekText) "bridges" idx
+                    <*> peekFieldRaw (peekListOrNil peekText) "frequency" idx
+                    <*> peekFieldRaw peekTextOrNil "terminators" idx
+                    <*> peekFieldRaw (peekListOrNil peekText) "direct_phrases" idx
+               )
 
 peekParserSpec :: Peeker Lua.Exception ParserSpec
 peekParserSpec idx = retrieving "ParserSpec" $ do
+    peekKnownKeys
+        ["version", "category", "strategy", "entries", "adverbs", "action_verbs", "suffix_verbs"]
+        idx
     version <- peekFieldRaw peekIntegral "version" idx
+    if version == supportedVersion
+        then pure ()
+        else fail ("unsupported spec version " <> show version <> "; expected " <> show supportedVersion)
     category <- peekFieldRaw peekText "category" idx
     stratText <- peekFieldRaw peekText "strategy" idx
     strategy <- case stratText of
@@ -136,12 +161,17 @@ validateSpec :: ParserSpec -> Either String ()
 validateSpec ps = checkSpecLevel >> mapM_ checkEntry (psEntries ps)
     where
         strat = psStrategy ps
-        checkSpecLevel = case strat of
-            VerbalStrategy ->
-                requireSpec "psAdverbs" (not (null (psAdverbs ps)))
-                    >> requireSpec "psActionVerbs" (not (null (psActionVerbs ps)))
-                    >> requireSpec "psSuffixVerbs" (not (null (psSuffixVerbs ps)))
-            _ -> Right ()
+        checkSpecLevel = do
+            requireSpec "psCategory" (not (isBlank (psCategory ps)))
+            requireSpec "psAdverbs" (noBlanks (psAdverbs ps))
+            requireSpec "psActionVerbs" (noBlanks (psActionVerbs ps))
+            requireSpec "psSuffixVerbs" (noBlanks (psSuffixVerbs ps))
+            case strat of
+                VerbalStrategy ->
+                    requireSpec "psAdverbs" (not (null (psAdverbs ps)))
+                        >> requireSpec "psActionVerbs" (not (null (psActionVerbs ps)))
+                        >> requireSpec "psSuffixVerbs" (not (null (psSuffixVerbs ps)))
+                _ -> Right ()
         requireSpec field ok
             | ok = Right ()
             | otherwise =
@@ -149,16 +179,28 @@ validateSpec ps = checkSpecLevel >> mapM_ checkEntry (psEntries ps)
                     T.unpack (psCategory ps)
                         <> " spec: "
                         <> field
-                        <> " must be non-empty"
-        checkEntry e = case strat of
-            PhraseStrategy ->
-                require "sePhrases" (not (null (sePhrases e))) e
-            VerbalStrategy ->
-                require "seSynonyms" (not (null (seSynonyms e))) e
-                    >> require "seTag" (not (T.null (seTag e))) e
+                        <> " must be non-empty, with no blank entries"
+        checkEntry e = checkEntryLiterals e >> checkEntryStrategy e
+        -- A blank literal matches the empty string, so it would fire at every
+        -- word start. Reject it in every list, whatever the strategy.
+        checkEntryLiterals e = do
+            require "seTag" (not (isBlank (seTag e))) e
+            require "sePhrases" (noBlanks (sePhrases e)) e
+            require "seSynonyms" (noBlanks (seSynonyms e)) e
+            require "seSuffixExtra" (noBlanks (seSuffixExtra e)) e
+            require "seTriggers" (noBlanks (seTriggers e)) e
+            require "seLabels" (noBlanks (seLabels e)) e
+            require "seBridges" (noBlanks (seBridges e)) e
+            require "seFrequency" (noBlanks (seFrequency e)) e
+            require "seDirectPhrases" (noBlanks (seDirectPhrases e)) e
+        checkEntryStrategy e = case strat of
+            PhraseStrategy -> require "sePhrases" (not (null (sePhrases e))) e
+            VerbalStrategy -> require "seSynonyms" (not (null (seSynonyms e))) e
             TriggerStrategy -> require "seTriggers" (not (null (seTriggers e))) e
             MonetaryStrategy -> require "seLabels" (not (null (seLabels e))) e
             CaptureStrategy -> require "seTriggers" (not (null (seTriggers e))) e
+        isBlank = T.null . T.strip
+        noBlanks = not . any isBlank
         require field ok e
             | ok = Right ()
             | otherwise =
@@ -169,37 +211,22 @@ validateSpec ps = checkSpecLevel >> mapM_ checkEntry (psEntries ps)
                         <> T.unpack (psCategory ps)
                         <> " spec: "
                         <> field
-                        <> " must be non-empty"
+                        <> " must be non-empty, with no blank entries"
 
--- | Load all @.lua@ files from @configDir/parsers/@ in a single Lua VM.
+{- | Load all @.lua@ files from @configDir/parsers/@ in a single Lua VM, in
+file-name order so the entry order (and so the hit order) is deterministic.
+-}
 loadParserSpecs :: FilePath -> IO [ParserSpec]
 loadParserSpecs configDir = do
     let parsersDir = configDir </> "parsers"
     files <- listDirectory parsersDir
-    let luaFiles = filter (".lua" `isSuffixOf`) files
+    let luaFiles = sort (filter (".lua" `isSuffixOf`) files)
     Lua.run $ mapM (loadOneSpecInVM . (parsersDir </>)) luaFiles
 
--- | Load one spec file; pops the result so subsequent files start clean.
+-- | Load and validate one spec file in the shared sandbox.
 loadOneSpecInVM :: FilePath -> Lua.LuaE Lua.Exception ParserSpec
 loadOneSpecInVM path = do
-    loadStatus <- Lua.loadfile (Just path)
-    case loadStatus of
-        Lua.OK -> do
-            -- Restrict the chunk to an empty environment: no globals, no stdlib,
-            -- no side-effects. Config files are pure data tables.
-            Lua.newtable
-            _ <- Lua.setupvalue (Lua.StackIndex (-2)) 1
-            callStatus <- Lua.pcall 0 1 Nothing
-            case callStatus of
-                Lua.OK -> do
-                    spec <- forcePeek $ peekParserSpec Lua.top
-                    Lua.pop 1
-                    case validateSpec spec of
-                        Right () -> pure spec
-                        Left msg -> Lua.failLua msg
-                _ -> do
-                    msg <- forcePeek $ peekText Lua.top
-                    Lua.failLua (T.unpack msg)
-        _ -> do
-            msg <- forcePeek $ peekText Lua.top
-            Lua.failLua (T.unpack msg)
+    spec <- loadSandboxed path peekParserSpec
+    case validateSpec spec of
+        Right () -> pure spec
+        Left msg -> Lua.failLua (path <> ": " <> msg)

@@ -8,11 +8,12 @@ module Chompsky.TUI.State
     , updateState
     ) where
 
+import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
 
 import Chompsky.Types (BackfillEvent (..), Confidence (..))
 
-data Phase = Fetching | Processing | Writing | Done
+data Phase = Fetching | Processing | Done | Failed Text
     deriving (Show, Eq)
 
 data TUIState = TUIState
@@ -61,6 +62,5 @@ updateState now ev st = case ev of
             , tsMedConf = tsMedConf st + case conf of Medium -> 1; _ -> 0
             , tsLowConf = tsLowConf st + case conf of Low -> 1; _ -> 0
             }
-    CsvWriteStarted -> st {tsPhase = Writing}
-    CsvWriteDone -> st
     BackfillFinished -> st {tsPhase = Done, tsFinished = True}
+    BackfillFailed msg -> st {tsPhase = Failed msg, tsFinished = True}

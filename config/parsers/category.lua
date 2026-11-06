@@ -1,7 +1,7 @@
 -- PhraseStrategy: matches literal phrases to classify items into category tags.
 -- Required fields: version, category, strategy, entries
 -- Each entry requires: tag (string), phrases (non-empty list of strings)
--- Phrases should be ordered longest-first within each entry for correct longest-match behavior.
+-- Phrases may be listed in any order: the scanner tries the longest first.
 
 return {
   version  = 1,
