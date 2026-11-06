@@ -34,14 +34,13 @@ buildEntries spec = go Map.empty (psEntries spec)
 buildOne :: ParserSpec -> Text -> SpecEntry -> ScannerEntry
 buildOne spec eid entry =
     let cat = psCategory spec
-        merge = CollectUnique
         parser = case psStrategy spec of
             PhraseStrategy -> buildPhraseParser entry
             VerbalStrategy -> buildVerbalParser spec entry
             TriggerStrategy -> buildTriggerParser entry
             MonetaryStrategy -> buildMonetaryParser entry
             CaptureStrategy -> buildCaptureParser entry
-     in ScannerEntry eid cat merge parser
+     in ScannerEntry eid cat parser
 
 buildPhraseParser :: SpecEntry -> Parser ExtractedValue
 buildPhraseParser entry =
@@ -63,7 +62,7 @@ buildVerbalParser spec entry =
         suffixVerbs = psSuffixVerbs spec
         directPhrases = seDirectPhrases entry
 
-        -- "replaced roof" / "updated kitchen" — verb then synonym
+        -- "replaced roof" / "updated kitchen": verb then synonym
         prefixForm = do
             _ <- oneOfLits actionVerbs
             ws
@@ -71,7 +70,7 @@ buildVerbalParser spec entry =
             _ <- oneOfLits synonyms
             TagWithYear tag <$> optionalYear
 
-        -- "roof replaced" / "kitchen updated in 2020" — synonym then verb
+        -- "roof replaced" / "kitchen updated in 2020": synonym then verb
         suffixForm = do
             _ <- oneOfLits (synonyms ++ suffixExtra)
             ws
@@ -79,7 +78,7 @@ buildVerbalParser spec entry =
             _ <- oneOfLits suffixVerbs
             TagWithYear tag <$> optionalYear
 
-        -- "recently installed solar" — adverb then direct phrase
+        -- "recently installed solar": adverb then direct phrase
         adverbDirectForm = do
             _ <- oneOfLits adverbs
             ws
@@ -92,13 +91,19 @@ buildTriggerParser entry = do
     _ <- optional ws
     YearValue <$> yearP
 
+{- | Label, optional bridge word, amount, optional frequency. Labels and
+bridges in the config may carry a trailing space and frequencies a leading
+one, so whitespace between the pieces is optional here, and every optional
+piece is wrapped in 'try' so a partial match backs out instead of failing
+the whole parse.
+-}
 buildMonetaryParser :: SpecEntry -> Parser ExtractedValue
 buildMonetaryParser entry = do
     _ <- oneOfLits (seLabels entry)
-    _ <- optional (ws *> oneOfLits (seBridges entry))
+    _ <- optional (try (optional ws *> oneOfLits (seBridges entry)))
     _ <- optional ws
     amt <- amountP
-    _ <- optional (ws *> oneOfLits (seFrequency entry))
+    _ <- optional (try (oneOfLits (seFrequency entry)))
     pure (AmountValue amt)
 
 buildCaptureParser :: SpecEntry -> Parser ExtractedValue

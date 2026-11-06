@@ -11,7 +11,15 @@ import Data.Text qualified as T
 import Hazy
 
 {- | Inputs clamped: featureCount ≤ 10, ambiguityCount ≤ 5.
-Tiers: High ≥ 0.65, Medium ≥ 0.35, Low < 0.35.
+Tiers: High ≥ 0.65, Medium ≥ 0.35, Low < 0.35. Canonical home for these
+cutoffs; the membership functions and rule table below are the tuning knobs.
+See docs/reference/internal/design-decisions.md ("Fuzzy confidence model")
+for the rationale.
+
+Hazy's 'triangular' and 'trapezoidal' are 0 at their outer feet (@x <= a@
+and @x >= d@), so a term that must be fully on at a bound of its variable
+gets a shoulder that reaches past the bound: @trapezoidal (-1) 0 0 c@ at
+the low end, @trapezoidal a b hi (hi + 1)@ at the high end.
 -}
 fuzzyConfidence :: Int -> Int -> (Double, Confidence)
 fuzzyConfidence featureCount ambiguityCount =
@@ -48,9 +56,9 @@ featuresVar =
         { lvName = "features"
         , lvTerms =
             Map.fromList
-                [ ("few", FuzzySet "few" (triangular 0 0 2) (0, 10))
+                [ ("few", FuzzySet "few" (trapezoidal (-1) 0 0 2) (0, 10))
                 , ("some", FuzzySet "some" (triangular 1 3 5) (0, 10))
-                , ("many", FuzzySet "many" (trapezoidal 4 6 10 10) (0, 10))
+                , ("many", FuzzySet "many" (trapezoidal 4 6 10 11) (0, 10))
                 ]
         , lvBounds = (0, 10)
         }
@@ -61,9 +69,9 @@ ambiguityVar =
         { lvName = "ambiguity"
         , lvTerms =
             Map.fromList
-                [ ("none", FuzzySet "none" (triangular 0 0 1) (0, 5))
+                [ ("none", FuzzySet "none" (trapezoidal (-1) 0 0 1) (0, 5))
                 , ("mild", FuzzySet "mild" (triangular 0 1 3) (0, 5))
-                , ("severe", FuzzySet "severe" (trapezoidal 2 3 5 5) (0, 5))
+                , ("severe", FuzzySet "severe" (trapezoidal 2 3 5 6) (0, 5))
                 ]
         , lvBounds = (0, 5)
         }

@@ -47,6 +47,7 @@ triage cfg (CleanedText cleanedText) ext =
 countFeatures :: Extraction -> Int
 countFeatures = sum . map length . Map.elems . categories
 
+-- | Fire when the text is long (word count over threshold) yet nothing was extracted.
 checkLongNoSignal :: Int -> Int -> Extraction -> [TriageDetail]
 checkLongNoSignal threshold wordCount ext
     | wordCount > threshold && fc == 0 = [LongNoSignal wordCount fc]
@@ -54,6 +55,7 @@ checkLongNoSignal threshold wordCount ext
     where
         fc = countFeatures ext
 
+-- | Fire when a known ambiguous phrase for a category appears in the text.
 checkAmbiguousPhrases :: [(Text, [Text])] -> Text -> [TriageDetail]
 checkAmbiguousPhrases pairs text =
     mapMaybe toDetail pairs
@@ -62,19 +64,25 @@ checkAmbiguousPhrases pairs text =
             [] -> Nothing
             matched -> Just (AmbiguousPhrase cat matched)
 
+{- | Fire when a category's watch words appear often (over threshold) but it
+extracted nothing. Punctuation is trimmed from each word before the lookup,
+so @"roof,"@ counts as @"roof"@.
+-}
 checkHighVocabNoExtraction :: [(Text, [Text])] -> Int -> [Text] -> Extraction -> [TriageDetail]
 checkHighVocabNoExtraction watchLists threshold wordList ext =
     mapMaybe toDetail watchLists
     where
+        normalizedWords = map (T.toLower . T.dropAround (not . isAlphaNum)) wordList
         toDetail (cat, ws)
             | matchCount > threshold && null (Map.findWithDefault [] cat (categories ext)) =
-                Just (HighVocabNoExtraction cat matchCount (map T.toLower matched))
+                Just (HighVocabNoExtraction cat matchCount matched)
             | otherwise = Nothing
             where
                 wordSet = Set.fromList ws
-                matched = filter (\w -> Set.member (T.toLower w) wordSet) wordList
+                matched = filter (`Set.member` wordSet) normalizedWords
                 matchCount = length matched
 
+-- | Fire when a category holds both a positive and a negative tag at once.
 checkConflictingTags :: [(Text, [Text], [Text])] -> Extraction -> [TriageDetail]
 checkConflictingTags pairs ext =
     mapMaybe toDetail pairs
@@ -87,6 +95,7 @@ checkConflictingTags pairs ext =
                 pos = filter (`elem` posTags) tagTexts
                 neg = filter (`elem` negTags) tagTexts
 
+-- | Fire when the non-ASCII character ratio exceeds threshold (likely garbled text).
 checkUnrecognizable :: Double -> Int -> Int -> [TriageDetail]
 checkUnrecognizable threshold textLen nonAsciiCount
     | textLen == 0 = []
@@ -95,6 +104,11 @@ checkUnrecognizable threshold textLen nonAsciiCount
     where
         ratio = fromIntegral nonAsciiCount / fromIntegral textLen
 
+{- | Case-insensitive substring search that matches only on word boundaries, so
+@"air"@ does not match inside @"repair"@. One of several sites with this policy;
+see docs/reference/internal/design-decisions.md ("Word-boundary matching is
+duplicated on purpose").
+-}
 containsPhrase :: Text -> Text -> Bool
 containsPhrase phrase text = go (T.toLower text)
     where

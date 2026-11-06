@@ -1,66 +1,36 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE StrictData #-}
 
--- | CSV output for extraction and review rows (cassava named-record API).
+-- | CSV output for extraction and review rows, written one row at a time.
 module Chompsky.IO.Csv
     ( ExtractionRow (..)
     , ReviewRow (..)
-    , buildCsvRows
-    , writeExtractions
-    , writeReviews
+    , toExtractionRow
+    , toReviewRow
+    , withCsvOutput
     ) where
 
+import Control.Exception (onException)
 import Data.Aeson qualified as Aeson
+import Data.ByteString.Builder (hPutBuilder)
 import Data.ByteString.Lazy qualified as BL
-
 import Data.Csv
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Csv.Builder (encodeDefaultOrderedNamedRecord, encodeHeader)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8)
+import System.Directory (removePathForcibly, renameFile)
+import System.IO (IOMode (..), withBinaryFile)
 
 import Chompsky.Pipeline (ProcessResult (..))
 import Chompsky.Types
 
-import System.IO (IOMode (..), withFile)
-
--- | Split pipeline results into extraction rows (all) and review rows (flagged only).
-buildCsvRows :: Text -> [(InputRow, ProcessResult)] -> ([ExtractionRow], [ReviewRow])
-buildCsvRows nowText results = (extractionRows, reviewRows)
-    where
-        toJson :: Aeson.ToJSON a => a -> Text
-        toJson = decodeUtf8 . BL.toStrict . Aeson.encode
-        extractionRows =
-            [ ExtractionRow
-                { erRowId = rowId row
-                , erExtractionJson = toJson (categories ext)
-                , erNeedsLlm = needsLlm ext
-                , erConfidence = confidenceToText (parserConfidence ext)
-                , erConfidenceScore = confidenceScore ext
-                , erParsedAt = nowText
-                }
-            | (row, ProcessResult ext _) <- results
-            ]
-        reviewRows = mapMaybe toReview results
-        toReview (row, ProcessResult ext cleaned) =
-            if needsLlm ext
-                then
-                    Just
-                        ReviewRow
-                            { rrRowId = rowId row
-                            , rrRemarksClean = T.pack (show cleaned)
-                            , rrTriageReason = fromMaybe "" (llmReason ext)
-                            , rrTriageDetails = toJson (triageDetails ext)
-                            , rrPartialExtraction = toJson (categories ext)
-                            }
-                else Nothing
-
 -- | One row in the extractions output CSV.
 data ExtractionRow = ExtractionRow
     { erRowId :: Text
-    -- ^ Source row identifier.
     , erExtractionJson :: Text
-    -- ^ Full categories map serialised as JSON.
+    -- ^ Full categories map serialized as JSON.
     , erNeedsLlm :: Bool
     -- ^ Whether this row was flagged for LLM review.
     , erConfidence :: Text
@@ -74,16 +44,67 @@ data ExtractionRow = ExtractionRow
 -- | One row in the reviews output CSV (only rows flagged for LLM review).
 data ReviewRow = ReviewRow
     { rrRowId :: Text
-    -- ^ Source row identifier.
     , rrRemarksClean :: Text
     -- ^ Cleaned remark text.
     , rrTriageReason :: Text
-    -- ^ Human-readable triage reason.
+    -- ^ Comma-joined tags of the triage rules that fired.
     , rrTriageDetails :: Text
-    -- ^ Triage details serialised as JSON.
+    -- ^ Triage details serialized as JSON.
     , rrPartialExtraction :: Text
-    -- ^ Partial extraction serialised as JSON.
+    -- ^ Partial extraction serialized as JSON.
     }
+
+-- | The extractions row for one processed input row, stamped with @parsedAt@.
+toExtractionRow :: Text -> InputRow -> ProcessResult -> ExtractionRow
+toExtractionRow parsedAt row (ProcessResult ext _) =
+    ExtractionRow
+        { erRowId = rowId row
+        , erExtractionJson = toJsonText (categories ext)
+        , erNeedsLlm = needsLlm ext
+        , erConfidence = confidenceToText (parserConfidence ext)
+        , erConfidenceScore = confidenceScore ext
+        , erParsedAt = parsedAt
+        }
+
+-- | The reviews row for one processed input row, if triage flagged it.
+toReviewRow :: InputRow -> ProcessResult -> Maybe ReviewRow
+toReviewRow row (ProcessResult ext cleaned)
+    | needsLlm ext =
+        Just
+            ReviewRow
+                { rrRowId = rowId row
+                , rrRemarksClean = unCleanedText cleaned
+                , rrTriageReason = fromMaybe "" (llmReason ext)
+                , rrTriageDetails = toJsonText (triageDetails ext)
+                , rrPartialExtraction = toJsonText (categories ext)
+                }
+    | otherwise = Nothing
+
+toJsonText :: Aeson.ToJSON a => a -> Text
+toJsonText = decodeUtf8 . BL.toStrict . Aeson.encode
+
+{- | Open a CSV for row-at-a-time writing: write the header, hand the caller a
+function that appends one row, and move the file into place at @path@ only
+once the action finishes. Rows go to @path.partial@ until then, and if the
+action throws or is cancelled the partial file is deleted, so @path@ never
+holds a half-written run.
+-}
+withCsvOutput ::
+    forall row a.
+    (DefaultOrdered row, ToNamedRecord row) =>
+    FilePath ->
+    ((row -> IO ()) -> IO a) ->
+    IO a
+withCsvOutput path action = do
+    let partial = path <> ".partial"
+        writeAll = withBinaryFile partial WriteMode $ \h -> do
+            -- cassava's headerOrder takes a value only for its type; both
+            -- instances below ignore it, as cassava's own docs do.
+            hPutBuilder h (encodeHeader (headerOrder (undefined :: row)))
+            action (hPutBuilder h . encodeDefaultOrderedNamedRecord)
+    result <- writeAll `onException` removePathForcibly partial
+    renameFile partial path
+    pure result
 
 instance ToNamedRecord ExtractionRow where
     toNamedRecord r =
@@ -126,15 +147,3 @@ instance DefaultOrdered ReviewRow where
             , "triage_details"
             , "partial_extraction"
             ]
-
--- | Write extraction rows to a CSV file.
-writeExtractions :: FilePath -> [ExtractionRow] -> IO ()
-writeExtractions path rows =
-    withFile path WriteMode $ \h ->
-        BL.hPut h (encodeDefaultOrderedByName rows)
-
--- | Write review rows to a CSV file.
-writeReviews :: FilePath -> [ReviewRow] -> IO ()
-writeReviews path rows =
-    withFile path WriteMode $ \h ->
-        BL.hPut h (encodeDefaultOrderedByName rows)

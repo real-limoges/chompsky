@@ -14,7 +14,8 @@ import Chompsky.Types (EditKind (..), Span (..), TextEdit (..))
 
 {- | Run both phases; each edit's span references the text at the moment that
 edit fires, so consumers can replay edits in order against the lowercased
-input.
+input. See docs/reference/internal/design-decisions.md ("Edit-log replay
+invariant").
 -}
 normalize :: AbbreviationConfig -> Text -> (Text, [TextEdit])
 normalize cfg input =
@@ -30,6 +31,10 @@ applyPhraseReplacements pairs t0 =
             let (txt', new) = replacePhraseAll pat rep txt
              in (txt', edits ++ new)
 
+{- | Boundary-checked global replace. @outPos@ tracks the offset in the text
+being built (for edit spans) while @remaining@ is the input still to consume;
+the two diverge whenever @rep@ and @pat@ differ in length.
+-}
 replacePhraseAll :: Text -> Text -> Text -> (Text, [TextEdit])
 replacePhraseAll pat rep = go 0 T.empty
     where
@@ -68,32 +73,28 @@ replacePhraseAll pat rep = go 0 T.empty
                 rightOk = T.null after || not (isAlphaNum (T.head after))
              in leftOk && rightOk
 
+{- | Replace whole words from the dictionary. @outPos@ is the offset in the
+output built so far, so each edit's span is in the text as it stands when
+that edit is applied in order (the same contract as 'replacePhraseAll').
+-}
 applyWordReplacements :: HashMap Text Text -> Text -> (Text, [TextEdit])
 applyWordReplacements dict input =
-    let (pieces, edits) = foldl' step ([], []) (zipWithOffsets (tokenize input))
+    let (pieces, edits, _) = foldl' step ([], [], 0) (tokenize input)
      in (T.concat (reverse pieces), reverse edits)
     where
-        step (pieces, edits) (off, Word w)
+        step (pieces, edits, outPos) (Word w)
             | Just rep <- HashMap.lookup w dict =
                 let ed =
                         TextEdit
                             { teKind = AbbrevWord
-                            , teSpan = Span off (off + T.length w)
+                            , teSpan = Span outPos (outPos + T.length w)
                             , teBefore = w
                             , teAfter = rep
                             , teDetail = Just w
                             }
-                 in (rep : pieces, ed : edits)
-            | otherwise = (w : pieces, edits)
-        step (pieces, edits) (_, Sep s) = (s : pieces, edits)
-
-zipWithOffsets :: [Token] -> [(Int, Token)]
-zipWithOffsets = go 0
-    where
-        go _ [] = []
-        go n (t : ts) = (n, t) : go (n + tokenLen t) ts
-        tokenLen (Word w) = T.length w
-        tokenLen (Sep s) = T.length s
+                 in (rep : pieces, ed : edits, outPos + T.length rep)
+            | otherwise = (w : pieces, edits, outPos + T.length w)
+        step (pieces, edits, outPos) (Sep s) = (s : pieces, edits, outPos + T.length s)
 
 data Token = Word Text | Sep Text
 

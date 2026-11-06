@@ -9,10 +9,10 @@ module Chompsky.Pipeline.Scanner
     , hitsToExtraction
     ) where
 
-import Data.Char (isAlphaNum)
+import Data.Char (isAlphaNum, isSpace)
 import Data.List (find)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Maybe (isJust, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -70,8 +70,9 @@ negationWords =
 isWordChar :: Char -> Bool
 isWordChar c = isAlphaNum c || c == '\'' || c == '\x2019'
 
-{- | Up to @n@ words immediately before @pos@, lowercased, nearest-first.
-Apostrophes are word-internal so contractions stay whole.
+{- | Up to @n@ words immediately before @pos@, lowercased, nearest-first,
+never reaching back past a sentence break. Apostrophes are word-internal so
+contractions stay whole.
 -}
 precedingWords :: VU.Vector Char -> Int -> Int -> [Text]
 precedingWords vec pos = goSkip (pos - 1)
@@ -79,7 +80,14 @@ precedingWords vec pos = goSkip (pos - 1)
         goSkip i remaining
             | i < 0 || remaining == 0 = []
             | isWordChar (VU.unsafeIndex vec i) = goWord i i remaining
+            | isSentenceBreak i = []
             | otherwise = goSkip (i - 1) remaining
+
+        -- A newline, or sentence punctuation followed by whitespace. A decimal
+        -- point, as in "25.99", has a digit after it and is not a break.
+        isSentenceBreak i =
+            let c = VU.unsafeIndex vec i
+             in c == '\n' || (c `elem` (".;?!" :: String) && isSpace (VU.unsafeIndex vec (i + 1)))
 
         goWord wordEnd cur remaining
             | cur > 0 && isWordChar (VU.unsafeIndex vec (cur - 1)) = goWord wordEnd (cur - 1) remaining
@@ -89,44 +97,29 @@ precedingWords vec pos = goSkip (pos - 1)
 
 {- | Run every entry across the input text, returning the merged 'Extraction'
 and the flat list of all hits (including negated ones, for trace consumers).
+Negated hits are kept in the hit list but dropped from the 'Extraction'; see
+docs/reference/internal/design-decisions.md ("Negation: scan then filter").
 -}
 scanAll :: [ScannerEntry] -> Text -> (Extraction, [ScanHit])
 scanAll entries input =
-    let perEntry = [(e, collectMatches (seParser e) input) | e <- entries]
-        hits = concatMap (uncurry entryHits) perEntry
-        extraction = foldl' applyEntry emptyExtraction perEntry
-     in (extraction, hits)
-    where
-        applyEntry ext (entry, matches) =
-            let values = [v | RawMatch _ _ False _ v <- matches]
-             in mergeInto (seMerge entry) (seCategory entry) values ext
+    let hits = concat [entryHits e (collectMatches (seParser e) input) | e <- entries]
+     in (hitsToExtraction hits, hits)
 
 -- | Convenience: every hit, flat. Negated hits included.
 scanHits :: [ScannerEntry] -> Text -> [ScanHit]
 scanHits entries input = snd (scanAll entries input)
 
-{- | Collapse a list of 'ScanHit's into an 'Extraction', dropping negated hits
-and applying each entry's merge strategy. Requires the matching entries
-(same order as originally scanned) because the merge policy lives there.
+{- | Collapse 'ScanHit's into an 'Extraction': negated hits are dropped, and
+each category keeps its distinct values, sorted.
 -}
-hitsToExtraction :: [ScannerEntry] -> [ScanHit] -> Extraction
-hitsToExtraction entries hits = foldl' applyEntry emptyExtraction entries
+hitsToExtraction :: [ScanHit] -> Extraction
+hitsToExtraction hits =
+    emptyExtraction {categories = Map.map Set.toList valuesByCategory}
     where
-        byEntry = Map.fromListWith (flip (++)) [(shEntryId h, [h]) | h <- hits, not (shIsNegated h)]
-        applyEntry ext entry =
-            let values = maybe [] (map shValue) (Map.lookup (seId entry) byEntry)
-             in mergeInto (seMerge entry) (seCategory entry) values ext
-
-mergeInto :: MergeStrategy -> Text -> [ExtractedValue] -> Extraction -> Extraction
-mergeInto strategy cat values ext
-    | null merged = ext
-    | otherwise = ext {categories = Map.insert cat merged (categories ext)}
-    where
-        existing = fromMaybe [] (Map.lookup cat (categories ext))
-        merged = case strategy of
-            CollectUnique -> Set.toList $ Set.fromList (existing ++ values)
-            FirstWins -> if null existing then take 1 values else existing
-            Concatenate -> existing ++ values
+        valuesByCategory =
+            Map.fromListWith
+                Set.union
+                [(shCategory h, Set.singleton (shValue h)) | h <- hits, not (shIsNegated h)]
 
 data RawMatch = RawMatch
     { rmStart :: Int
@@ -169,8 +162,13 @@ collectMatches p original = mapMaybe (\pos -> tryAt pos (V.unsafeIndex suffixVec
         atWordStart 0 = True
         atWordStart i = not (isAlphaNum (VU.unsafeIndex charVec (i - 1)))
 
+        -- Right-boundary guard: mirror the left-boundary check in 'precedingWords'
+        -- so a parser can't match in the middle of a longer word.
         pBounded = p <* notFollowedBy (satisfy isAlphaNum)
 
+        -- Drive Megaparsec at the raw 'State' level (rather than 'runParser') so we
+        -- can read back the consumed length from 'stateOffset' to compute the match's
+        -- end offset, starting from this word-start position's suffix.
         tryAt pos sfx =
             let (stAfter, result) = runParser' pBounded (initialState sfx)
              in case result of

@@ -7,28 +7,28 @@ module Chompsky.IO.Workers
 
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
-import Data.IORef
 
 import Chompsky.Config (AppConfig (..), abbreviationConfig, boilerplateConfig, parserSpecs)
 import Chompsky.Pipeline (ProcessResult, processRemarkPureWith)
 import Chompsky.Pipeline.Parser (allEntries)
 import Chompsky.Types (InputRow (..))
 
--- | Feed rows through the pipeline via @producer@, invoking @callback@ after each.
+{- | Feed rows from @producer@ through the pipeline, handing each fully
+evaluated result to @callback@ as soon as it is ready. Nothing is kept, so
+memory stays flat; the callback decides what to do with each result.
+Scanner entries are built once, up front.
+-}
 processStreaming ::
     AppConfig ->
     ((InputRow -> IO ()) -> IO ()) ->
     (InputRow -> ProcessResult -> IO ()) ->
-    IO [(InputRow, ProcessResult)]
+    IO ()
 processStreaming cfg producer callback = do
     let entries = allEntries (parserSpecs cfg)
         abbrev = abbreviationConfig cfg
         bp = boilerplateConfig cfg
         tCfg = triageConfig cfg
-    resultsRef <- newIORef []
     producer $ \row -> do
         let result = processRemarkPureWith tCfg abbrev bp entries (rowText row)
         evaluated <- evaluate (force result)
         callback row evaluated
-        modifyIORef' resultsRef ((row, evaluated) :)
-    reverse <$> readIORef resultsRef

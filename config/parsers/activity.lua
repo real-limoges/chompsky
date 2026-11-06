@@ -1,8 +1,9 @@
 -- VerbalStrategy: detects action phrases applied to subjects.
--- Required fields: version, category, strategy, entries
--- Optional top-level fields: adverbs, action_verbs, suffix_verbs
+-- Required fields: version, category, strategy, entries,
+--   adverbs, action_verbs, suffix_verbs (each a non-empty list)
 -- Each entry requires: tag (string), synonyms (non-empty list)
--- Optional per-entry fields: direct_phrases, suffix_extra
+-- Optional per-entry fields: direct_phrases, suffix_extra (extra subjects
+--   accepted only in the suffix form, e.g. "machines" in "machines serviced")
 
 return {
   version  = 1,
@@ -13,10 +14,10 @@ return {
   adverbs      = { "recently", "completely", "fully", "partially", "thoroughly" },
 
   -- Verbs used in active constructions (e.g. "audited inventory")
-  action_verbs = { "inspected", "audited", "reviewed", "cataloged", "verified", "sorted" },
+  action_verbs = { "inspected", "audited", "reviewed", "cataloged", "verified", "sorted", "serviced" },
 
   -- Verbs used in passive/suffix constructions (e.g. "inventory audited")
-  suffix_verbs = { "inspected", "audited", "reviewed", "cataloged", "verified" },
+  suffix_verbs = { "inspected", "audited", "reviewed", "cataloged", "verified", "serviced" },
 
   entries = {
     { tag = "Inventory",
@@ -28,8 +29,7 @@ return {
       direct_phrases = { "inspected warehouse" } },
 
     { tag = "Equipment",
-      synonyms     = { "equipment", "machinery" },
-      suffix_extra = { "serviced" } },
+      synonyms = { "equipment", "machinery" } },
 
     { tag = "Records",
       synonyms = { "records", "documentation", "files" } },

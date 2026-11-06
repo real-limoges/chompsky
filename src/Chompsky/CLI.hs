@@ -2,27 +2,42 @@
 {-# LANGUAGE StrictData #-}
 
 -- | CLI entry point.
-module Chompsky.CLI (run, withErrorBoundary) where
+module Chompsky.CLI
+    ( run
+    , withErrorBoundary
+    , BackfillOpts (..)
+    , backfillWorker
+    ) where
 
-import Control.Concurrent.Async (withAsync)
+import Control.Concurrent.Async (wait, withAsync)
 import Control.Concurrent.STM (atomically, newTChanIO, writeTChan)
-import Control.Exception (Handler (..), IOException, catches, displayException)
+import Control.Exception
+    ( Handler (..)
+    , IOException
+    , SomeException
+    , catch
+    , catches
+    , displayException
+    , throwIO
+    )
 import Data.Aeson qualified as Aeson
 import Data.ByteString.Lazy.Char8 qualified as BL
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Time.Clock (getCurrentTime)
+import Data.Time.Format.ISO8601 (iso8601Show)
 import HsLua.Core qualified as Lua
 import Options.Applicative
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 
 import Chompsky.Config (AppConfig (..), loadConfig)
-import Chompsky.IO.Csv (buildCsvRows, writeExtractions, writeReviews)
-import Chompsky.IO.CsvInput (readInputCsv, readInputCsvLimit)
+import Chompsky.IO.Csv (toExtractionRow, toReviewRow, withCsvOutput)
+import Chompsky.IO.CsvInput (countInputRows, readInputCsvLimit, streamInputCsv)
 import Chompsky.IO.Workers (processStreaming)
 import Chompsky.Pipeline (ProcessResult (..), processRemarkPure)
-import Chompsky.TUI (runTUI, withLineBuffering)
+import Chompsky.TUI (formatSummary, runTUI, withLineBuffering)
+import Chompsky.TUI.State (TUIState (..))
 import Chompsky.Types
 
 run :: IO ()
@@ -33,10 +48,10 @@ run = do
         withErrorBoundary "loading config" $ loadConfig dir
     case cmd of
         ParseOne -> runParseOne cfg
-        Backfill bo -> withLineBuffering $ runBackfill cfg bo
+        Backfill bo -> withLineBuffering $ withErrorBoundary "running backfill" $ runBackfill cfg bo
         DryRun dro -> runDryRun cfg dro
 
--- | Catch known exceptions, print a labelled message to stderr, and exit.
+-- | Catch known exceptions, print a labeled message to stderr, and exit.
 withErrorBoundary :: String -> IO a -> IO a
 withErrorBoundary label act =
     act
@@ -49,44 +64,59 @@ withErrorBoundary label act =
             hPutStrLn stderr $ "Error " <> label <> ": " <> msg
             exitFailure
 
+{- | Run the worker beside the TUI. A worker failure is reported to the TUI
+(so it halts instead of waiting forever) and then re-raised here, so the
+outer 'withErrorBoundary' prints it and the process exits non-zero. Quitting
+the TUI before the worker finishes cancels the worker and also exits non-zero.
+-}
 runBackfill :: AppConfig -> BackfillOpts -> IO ()
 runBackfill cfg bo = do
     chan <- newTChanIO
-    withAsync (workerThread chan) $ \_ ->
-        runTUI chan
-    where
-        send chan ev = atomically (writeTChan chan ev)
-        workerThread chan = do
-            send chan InputFetchStarted
-            rows <- withErrorBoundary "reading input CSV" $ readInputCsv (bfInput bo)
-            send chan (InputFetchDone (length rows))
-            results <- processStreaming cfg (`mapM_` rows) $ \_ result ->
-                send chan (ItemProcessed (needsLlm (prExtraction result)) (parserConfidence (prExtraction result)))
-            now <- getCurrentTime
-            let nowText = T.pack (show now)
-                (extractionRows, reviewRows) = buildCsvRows nowText results
-            send chan CsvWriteStarted
-            withErrorBoundary "writing extractions CSV" $ writeExtractions (bfOutput bo) extractionRows
-            withErrorBoundary "writing reviews CSV" $
-                if null reviewRows
-                    then pure ()
-                    else writeReviews (bfReviews bo) reviewRows
-            send chan CsvWriteDone
-            send chan BackfillFinished
+    let send ev = atomically (writeTChan chan ev)
+        reportingFailure act =
+            act `catch` \(e :: SomeException) -> do
+                send (BackfillFailed (T.pack (displayException e)))
+                throwIO e
+    withAsync (reportingFailure (backfillWorker cfg bo send)) $ \worker -> do
+        finalSt <- runTUI chan
+        if tsFinished finalSt
+            then do
+                wait worker
+                putStrLn (formatSummary finalSt)
+            else do
+                hPutStrLn stderr ("Aborted after " <> show (tsProcessed finalSt) <> " rows; output files left unchanged.")
+                exitFailure
+
+{- | Count the input, then stream it: each row is read, processed and written
+before the next is read, so memory stays flat however large the input is.
+Reports progress through @send@ and throws on any failure; the caller turns
+that into 'BackfillFailed'. Both output files appear only when the run
+completes (see 'withCsvOutput'), and the reviews file is always written,
+header only when nothing was flagged, so a stale one is never left behind.
+-}
+backfillWorker :: AppConfig -> BackfillOpts -> (BackfillEvent -> IO ()) -> IO ()
+backfillWorker cfg bo send = do
+    send InputFetchStarted
+    total <- countInputRows (bfInput bo)
+    send (InputFetchDone total)
+    withCsvOutput (bfOutput bo) $ \writeExtraction ->
+        withCsvOutput (bfReviews bo) $ \writeReview ->
+            processStreaming cfg (streamInputCsv (bfInput bo)) $ \row result -> do
+                parsedAt <- T.pack . iso8601Show <$> getCurrentTime
+                writeExtraction (toExtractionRow parsedAt row result)
+                mapM_ writeReview (toReviewRow row result)
+                send (ItemProcessed (needsLlm (prExtraction result)) (parserConfidence (prExtraction result)))
+    send BackfillFinished
 
 runDryRun :: AppConfig -> DryRunOpts -> IO ()
 runDryRun cfg dro = do
     rows <-
         withErrorBoundary "reading input CSV" $
             readInputCsvLimit (drInput dro) (drLimit dro)
-    results <- processStreaming cfg (`mapM_` rows) (\_ _ -> pure ())
-    mapM_
-        ( \(row, ProcessResult ext _) -> do
-            TIO.putStrLn $ "--- " <> rowId row <> " ---"
-            BL.putStrLn $ Aeson.encode ext
-            TIO.putStrLn ""
-        )
-        results
+    processStreaming cfg (`mapM_` rows) $ \row (ProcessResult ext _) -> do
+        TIO.putStrLn $ "--- " <> rowId row <> " ---"
+        BL.putStrLn $ Aeson.encode ext
+        TIO.putStrLn ""
 
 runParseOne :: AppConfig -> IO ()
 runParseOne cfg = do

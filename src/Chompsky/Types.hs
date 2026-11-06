@@ -6,7 +6,6 @@
 -- | Domain types for the extraction pipeline.
 module Chompsky.Types
     ( ExtractedValue (..)
-    , MergeStrategy (..)
     , Confidence (..)
     , TriageDetail (..)
     , triageDetailTag
@@ -28,7 +27,7 @@ module Chompsky.Types
     ) where
 
 import Control.DeepSeq (NFData)
-import Control.Exception (Exception)
+import Control.Exception (Exception (..))
 import Data.Aeson
     ( FromJSON (..)
     , ToJSON (..)
@@ -40,6 +39,7 @@ import Data.Aeson
     , (.=)
     )
 import Data.Aeson.Types (Parser)
+import Data.Csv qualified as Csv
 import Data.Functor ((<&>))
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -63,24 +63,14 @@ data ExtractedValue
     deriving (Show, Eq, Ord, Generic)
     deriving anyclass (NFData)
 
--- | Controls how multiple extracted values for the same category are combined.
-data MergeStrategy
-    = -- | Keep only unique values (set semantics).
-      CollectUnique
-    | -- | Keep the first value encountered; discard later ones.
-      FirstWins
-    | -- | Concatenate all values in encounter order.
-      Concatenate
-    deriving (Show, Eq)
-
--- | Parser confidence tier, derived from fuzzy inference over feature count and ambiguity.
+{- | Parser confidence tier, derived from fuzzy inference over feature count and
+ambiguity. The score cutoffs that separate the tiers live with the code that
+enforces them, in 'Chompsky.Pipeline.Fuzzy.fuzzyConfidence'.
+-}
 data Confidence
-    = -- | Score >= 0.65.
-      High
-    | -- | Score >= 0.35 and < 0.65.
-      Medium
-    | -- | Score < 0.35.
-      Low
+    = High
+    | Medium
+    | Low
     deriving (Show, Eq, Ord, Enum, Bounded, Generic)
     deriving anyclass (NFData)
 
@@ -101,19 +91,21 @@ data TriageDetail
     deriving (Show, Eq, Generic)
     deriving anyclass (NFData)
 
--- | Machine-readable tag for a 'TriageDetail' (e.g. @"long_remarks_no_signal"@).
+{- | Machine-readable tag for a 'TriageDetail' (e.g. @"long_remarks_no_signal"@).
+Tags name the rule, never a domain; the category a rule fired for travels
+in the detail's own @category@ field.
+-}
 triageDetailTag :: TriageDetail -> Text
 triageDetailTag = \case
     LongNoSignal {} -> "long_remarks_no_signal"
-    AmbiguousPhrase {} -> "ambiguous_condition"
-    HighVocabNoExtraction {} -> "complex_renovation_narrative"
+    AmbiguousPhrase {} -> "ambiguous_phrase"
+    HighVocabNoExtraction {} -> "high_vocab_no_extraction"
     ConflictingTags {} -> "conflicting_signals"
     UnrecognizableText {} -> "unrecognizable_text"
 
 -- | Complete output of the extraction pipeline for a single input text.
 data Extraction = Extraction
     { categories :: Map Text [ExtractedValue]
-    -- ^ Extracted values keyed by category name.
     , needsLlm :: Bool
     -- ^ Whether triage flagged this extraction for LLM review.
     , llmReason :: Maybe Text
@@ -156,7 +148,7 @@ data Span = Span
     deriving (Show, Eq, Generic)
     deriving anyclass (NFData)
 
--- | A single scanner match — one firing of one parser entry.
+-- | A single scanner match: one firing of one parser entry.
 data ScanHit = ScanHit
     { shEntryId :: Text
     {- ^ Stable identifier for the parser entry that produced this hit,
@@ -176,15 +168,20 @@ data ScanHit = ScanHit
     deriving (Show, Eq, Generic)
     deriving anyclass (NFData)
 
--- | A single edit produced by the Normalize or Clean stage.
+{- | A single edit produced by the Normalize or Clean stage. Edits are meant to
+be replayed in order; see docs/reference/internal/design-decisions.md
+("Edit-log replay invariant").
+-}
 data TextEdit = TextEdit
     { teKind :: EditKind
     , teSpan :: Span
-    -- ^ Span in the pre-edit text (the input to the substep that emitted this edit).
+    {- ^ Span of 'teBefore' in the text as it stands just before this edit is
+    applied, i.e. after every earlier edit in the same stage's log.
+    -}
     , teBefore :: Text
     , teAfter :: Text
     , teDetail :: Maybe Text
-    -- ^ Optional extra context — e.g. the abbreviation key or boilerplate phrase.
+    -- ^ Optional extra context, such as the abbreviation key or boilerplate phrase.
     }
     deriving (Show, Eq, Generic)
     deriving anyclass (NFData)
@@ -223,33 +220,39 @@ data FuzzySnapshot = FuzzySnapshot
 -- | A single row from the input CSV (id + raw remark text).
 data InputRow = InputRow
     { rowId :: Text
-    -- ^ Unique row identifier from the source CSV.
     , rowText :: Text
-    -- ^ Raw remark text to be processed.
     }
     deriving (Show, Eq, Generic)
     deriving anyclass (NFData)
+
+-- | Read from the @id@ and @text@ columns of the input CSV.
+instance Csv.FromNamedRecord InputRow where
+    parseNamedRecord r =
+        InputRow
+            <$> r Csv..: "id"
+            <*> r Csv..: "text"
 
 -- | Top-level application error, caught at the CLI boundary.
 newtype ChompskyError = ChompskyError String
     deriving (Show)
 
-instance Exception ChompskyError
+instance Exception ChompskyError where
+    displayException (ChompskyError msg) = msg
 
 -- | Events emitted by the backfill worker thread, consumed by the TUI.
 data BackfillEvent
-    = -- | CSV input reading has begun.
+    = -- | Counting the input rows has begun.
       InputFetchStarted
-    | -- | CSV input reading complete; carries the total row count.
+    | -- | Input counted; carries the total row count.
       InputFetchDone Int
-    | -- | One row processed; carries whether it was flagged and its confidence tier.
+    | {- | One row processed and written to the output files; carries whether
+      it was flagged and its confidence tier.
+      -}
       ItemProcessed Bool Confidence
-    | -- | Output CSV writing has begun.
-      CsvWriteStarted
-    | -- | Output CSV writing complete.
-      CsvWriteDone
-    | -- | All work finished.
+    | -- | All work finished and the output files are in place.
       BackfillFinished
+    | -- | The worker failed; carries the error message. No further events follow.
+      BackfillFailed Text
     deriving (Show, Eq)
 
 -- | Triage-stage configuration loaded from @triage.lua@.
@@ -344,16 +347,22 @@ instance ToJSON TriageDetail where
                 , "non_ascii_ratio" .= ratio
                 ]
 
+{- | Also accepts the tags used before 2026-11-06 (@"ambiguous_condition"@ and
+@"complex_renovation_narrative"@), so output written by earlier runs still
+reads back.
+-}
 instance FromJSON TriageDetail where
     parseJSON = withObject "TriageDetail" $ \o -> do
         rule <- o .: "rule" :: Parser Text
         case rule of
             "long_remarks_no_signal" ->
                 LongNoSignal <$> o .: "word_count" <*> o .: "feature_count"
-            "ambiguous_condition" ->
-                AmbiguousPhrase <$> o .: "category" <*> o .: "matched_phrases"
-            "complex_renovation_narrative" ->
-                HighVocabNoExtraction <$> o .: "category" <*> o .: "word_count" <*> o .: "words"
+            _
+                | rule `elem` ["ambiguous_phrase", "ambiguous_condition"] ->
+                    AmbiguousPhrase <$> o .: "category" <*> o .: "matched_phrases"
+            _
+                | rule `elem` ["high_vocab_no_extraction", "complex_renovation_narrative"] ->
+                    HighVocabNoExtraction <$> o .: "category" <*> o .: "word_count" <*> o .: "words"
             "conflicting_signals" ->
                 ConflictingTags <$> o .: "category" <*> o .: "positive" <*> o .: "negative"
             "unrecognizable_text" ->

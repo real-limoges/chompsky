@@ -26,6 +26,7 @@ library
         Chompsky.Types
         Chompsky.Config
         Chompsky.Config.ParserSpec
+        Chompsky.Config.Sandbox
         Chompsky.Pipeline
         Chompsky.IO.Csv
         Chompsky.IO.CsvInput
@@ -113,3 +114,4 @@ test-suite chompsky-test
       , filepath
       , temporary
       , time
+      , hslua-core

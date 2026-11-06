@@ -9,7 +9,8 @@ return {
   strategy = "monetary",
   entries = {
     { tag = "MaintenanceCost",
-      -- Label phrases that introduce the amount (trailing space is significant)
+      -- Label phrases that introduce the amount. A trailing space is optional:
+      -- whitespace between label, bridge and amount is matched either way.
       labels    = { "maintenance fee ", "maintenance cost ", "maintenance " },
       -- Optional filler words between label and "$NNN"
       bridges   = { "is ", "of ", "approximately ", "around " },
